@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, field_validator, HttpUrl
 
 
 class CreateUrlRequest(BaseModel):
@@ -12,6 +12,17 @@ class CreateUrlRequest(BaseModel):
         default=None,
         examples=[(datetime.now(UTC) + timedelta(hours=24)).isoformat()],
     )
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def _blank_means_absent(cls, value):
+        # A browser form (e.g. Swagger UI's "Try it out") that leaves
+        # an untouched optional field submits "" rather than omitting
+        # the key entirely; Pydantic's datetime parser rejects that
+        # outright ("input is too short") instead of treating it the
+        # same as the field never having been provided. Normalizing
+        # here keeps both cases meaning the same thing: never expires.
+        return None if value == "" else value
 
 
 class UrlResponse(BaseModel):

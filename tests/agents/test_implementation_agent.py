@@ -231,3 +231,41 @@ async def test_expires_at_swagger_example_is_roughly_24h_out_not_current_time(
         created = client.post("/api/urls", json={"long_url": "https://example.com"})
         assert created.status_code == 201
         assert created.json()["expires_at"] is None, "omitting it must still mean never-expires"
+
+
+async def test_blank_expires_at_is_treated_as_absent_not_a_parse_error(
+    provider, node, tmp_path, monkeypatch
+):
+    """Reported directly, with the exact payload: Swagger UI's "Try it out"
+    form submits "" for an untouched optional field rather than omitting the
+    key. Pydantic's datetime parser rejected "" outright ("input is too
+    short") instead of treating it like the field was never provided. Also
+    covers custom_alias="" for the same reason, which already worked (an
+    empty string is falsy, so the route's `if payload.custom_alias:` check
+    already fell through to auto-generation) but is worth pinning down
+    alongside the actual fix so a future change can't silently break it."""
+    from fastapi.testclient import TestClient
+
+    ws = await _materialize(
+        provider, node, tmp_path,
+        "Build a URL shortener with custom aliases and expiration support.",
+        ["custom alias handling", "expiration handling"],
+    )
+    with materialized_app(ws.root, tmp_path, monkeypatch) as app, TestClient(app) as client:
+        created = client.post(
+            "/api/urls",
+            json={
+                "long_url": "https://github.com/sandredd/agentic-sdlc-orchestrator/tree/main",
+                "custom_alias": "",
+                "expires_at": "",
+            },
+        )
+        assert created.status_code == 201, created.text
+        body = created.json()
+        assert body["expires_at"] is None
+        assert len(body["code"]) == 6, (
+            "blank custom_alias must still fall through to auto-generation"
+        )
+
+        redirected = client.get(f"/{body['code']}", follow_redirects=False)
+        assert redirected.status_code == 302

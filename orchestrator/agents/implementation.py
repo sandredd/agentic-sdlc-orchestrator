@@ -266,18 +266,31 @@ def _models_py(caps: dict[str, bool]) -> str:
         # changes what /docs pre-fills; it does not change what an omitted
         # field defaults to.
         datetime_import = "from datetime import UTC, datetime, timedelta"
-        pydantic_import = "from pydantic import BaseModel, Field, HttpUrl"
+        pydantic_import = "from pydantic import BaseModel, Field, field_validator, HttpUrl"
         expiry_request_field = (
             "\n    expires_at: datetime | None = Field(\n"
             "        default=None,\n"
             "        examples=[(datetime.now(UTC) + timedelta(hours=24)).isoformat()],\n"
             "    )"
         )
+        expiry_validator = (
+            '\n\n    @field_validator("expires_at", mode="before")\n'
+            "    @classmethod\n"
+            "    def _blank_means_absent(cls, value):\n"
+            '        # A browser form (e.g. Swagger UI\'s "Try it out") that leaves\n'
+            '        # an untouched optional field submits "" rather than omitting\n'
+            "        # the key entirely; Pydantic's datetime parser rejects that\n"
+            '        # outright ("input is too short") instead of treating it the\n'
+            "        # same as the field never having been provided. Normalizing\n"
+            "        # here keeps both cases meaning the same thing: never expires.\n"
+            '        return None if value == "" else value'
+        )
         expiry_response_field = "\n    expires_at: datetime | None = None"
     else:
         datetime_import = "from datetime import datetime"
         pydantic_import = "from pydantic import BaseModel, HttpUrl"
         expiry_request_field = ""
+        expiry_validator = ""
         expiry_response_field = ""
 
     template = '''"""Pydantic request/response schemas."""
@@ -288,7 +301,7 @@ __PYDANTIC_IMPORT__
 
 
 class CreateUrlRequest(BaseModel):
-    long_url: HttpUrl__ALIAS_FIELD____EXPIRY_REQUEST_FIELD__
+    long_url: HttpUrl__ALIAS_FIELD____EXPIRY_REQUEST_FIELD____EXPIRY_VALIDATOR__
 
 
 class UrlResponse(BaseModel):
@@ -306,6 +319,7 @@ class StatsResponse(BaseModel):
         .replace("__PYDANTIC_IMPORT__", pydantic_import)
         .replace("__ALIAS_FIELD__", alias_field)
         .replace("__EXPIRY_REQUEST_FIELD__", expiry_request_field)
+        .replace("__EXPIRY_VALIDATOR__", expiry_validator)
         .replace("__EXPIRY_RESPONSE_FIELD__", expiry_response_field)
         .replace("__STATS_FIELDS__", stats_fields)
     )
