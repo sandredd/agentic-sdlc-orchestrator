@@ -79,3 +79,60 @@ async def test_pyproject_toml_scopes_pytest_rootdir_to_target(provider, node):
     assert "pyproject.toml" in by_path
     assert "[tool.pytest.ini_options]" in by_path["pyproject.toml"].content
     assert "asyncio_mode" not in by_path["pyproject.toml"].content
+
+
+async def test_startup_prints_every_registered_route_not_just_top_level_ones(
+    provider, node, tmp_path
+):
+    """Regression test: the route table used to be built by walking
+    `app.routes` and filtering to `isinstance(route, APIRoute)`, but a
+    router included via `app.include_router(router)` is wrapped in an
+    internal container type (not an `APIRoute` instance) in newer FastAPI
+    versions -- so every endpoint from `app/routes.py` silently disappeared
+    from the printed list, leaving only the one route (`/health`) declared
+    directly on `app`. Fixed by reading `app.openapi()["paths"]` instead,
+    the same public, stable source that drives the real `/docs` page.
+
+    This has to run the real generated app (not just parse the template) to
+    catch the bug -- it only manifests once FastAPI actually processes a real
+    `include_router` call.
+    """
+    import sys
+
+    from orchestrator.core.workspace import Workspace
+
+    state = state_for("Build a URL shortener with custom aliases.")
+    state.context.set(
+        "plan", {"tasks": [{"title": "custom alias handling"}]}, writer="planning"
+    )
+    ws = Workspace(tmp_path / "ws")
+    result = await ImplementationAgent(provider).run(node, state)
+    for a in result.artifacts:
+        ws.write_artifact(a)
+
+    sys.path.insert(0, str(ws.root))
+    try:
+        import importlib
+
+        for mod in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
+            del sys.modules[mod]
+
+        import io
+        from contextlib import redirect_stdout
+
+        from fastapi.testclient import TestClient
+
+        main = importlib.import_module("app.main")
+        buf = io.StringIO()
+        with redirect_stdout(buf), TestClient(main.app):
+            pass
+        output = buf.getvalue()
+    finally:
+        sys.path.remove(str(ws.root))
+        for mod in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
+            del sys.modules[mod]
+
+    assert "GET     /health" in output
+    assert "POST    /api/urls" in output
+    assert "GET     /{code}" in output
+    assert "GET     /api/urls/{code}" in output
