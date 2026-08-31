@@ -168,18 +168,31 @@ class ArchitectureAgent(Agent):
             context={"design": {"storage": "sqlite", "code_scheme": "base62-autoincrement"}},
         )
 
+    # Paths under these prefixes are the run's own generated output about the
+    # codebase (docs, reports, the API spec, the top-level README) rather than
+    # the codebase itself. They are prose, so they naturally contain more
+    # keyword hits than a terse source file ever will -- left unfiltered, they
+    # dominate the ranking and bury the actual modules a change would touch.
+    # "Codebase reasoning" means reasoning about the code.
+    _NON_SOURCE_PREFIXES = ("docs/", "api/")
+    _NON_SOURCE_PATHS = frozenset({"README.md"})
+
     def _codebase_reasoning(
         self, state: RunState, nreq: NormalizedRequirement | None
     ) -> tuple[list[str], str]:
-        """Rank existing workspace files by keyword overlap with the
+        """Rank existing source files by keyword overlap with the
         requirement. A real static-analysis pass (import graphs, call graphs)
         would do better than lexical overlap, but this is enough to point a
         reviewer at the right module and demonstrates the reasoning runs
         against the actual seeded codebase, not asserted blind.
+
+        Only the raw requirement statement feeds the term set, not the
+        normalized problem statement -- that carries a synthetic suffix
+        ("-- normalized for a URL shortener service (X scenario)") whose
+        words ("normalized", "scenario", "service") match nearly everything
+        in this codebase and drown out the terms that actually discriminate.
         """
         terms = set(_WORD.findall(state.requirement.statement.lower()))
-        if nreq is not None:
-            terms |= set(_WORD.findall(nreq.problem_statement.lower()))
         terms -= {"with", "that", "this", "from", "have", "will", "should"}
 
         if self.workspace is None:
@@ -187,6 +200,8 @@ class ArchitectureAgent(Agent):
 
         scored: list[tuple[int, str, list[str]]] = []
         for path in self.workspace.files():
+            if path.startswith(self._NON_SOURCE_PREFIXES) or path in self._NON_SOURCE_PATHS:
+                continue
             path_terms = set(_WORD.findall(path.lower()))
             hits = path_terms & terms
             try:
@@ -202,7 +217,7 @@ class ArchitectureAgent(Agent):
         top = scored[:8]
         impacted = [path for _, path, _ in top]
         if not impacted:
-            return [], f"no existing file matched keywords from the requirement ({sorted(terms)})"
+            return [], f"no existing source file matched requirement keywords {sorted(terms)}"
 
         lines = [f"Matched against requirement keywords {sorted(terms)}:"]
         for _count, path, hits in top:

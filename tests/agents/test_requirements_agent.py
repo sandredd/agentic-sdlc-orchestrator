@@ -91,3 +91,34 @@ async def test_brownfield_kind_is_reflected_in_problem_statement(provider, node)
     result = await agent.run(node, state_for("Fix the redirect bug.", ScenarioKind.BROWNFIELD))
     nreq = result.context_updates["normalized_requirement"]
     assert "brownfield" in nreq["problem_statement"]
+
+
+async def test_unrequested_capabilities_are_not_silently_added_to_scope(provider, node):
+    """Regression test: functional_line used to be appended unconditionally
+    regardless of whether the aspect was actually requested, so every build
+    silently included every optional capability -- scope creep an unattended
+    agent must not commit on its own."""
+    agent = RequirementsAgent(provider)
+    result = await agent.run(
+        node, state_for("Build a minimal URL shortener with just the core create and "
+                         "redirect APIs.")
+    )
+    nreq = result.context_updates["normalized_requirement"]
+    functional_text = " ".join(nreq["functional"]).lower()
+    assert "custom alias" not in functional_text
+    assert "expiration" not in functional_text
+    assert "click analytics" not in functional_text
+    assert "rate-limit" not in functional_text
+    # Always-on descriptive properties (not gated capabilities) remain present.
+    assert "persist shortened urls" in functional_text
+
+
+async def test_requested_capability_is_added_to_functional_scope(provider, node):
+    agent = RequirementsAgent(provider)
+    result = await agent.run(
+        node, state_for("Build a URL shortener with custom alias support.")
+    )
+    nreq = result.context_updates["normalized_requirement"]
+    functional_text = " ".join(nreq["functional"]).lower()
+    assert "custom alias" in functional_text
+    assert "expiration" not in functional_text

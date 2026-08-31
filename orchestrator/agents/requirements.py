@@ -53,43 +53,63 @@ thing; keep those rare and specific. Respond with JSON only, no prose."""
 
 # Domain vocabulary used by the deterministic fallback to decide what the
 # requirement did and did not address. Each tuple is:
-#   (keywords that mean "this was specified", assumption text, confidence, functional line)
-_ASPECTS: tuple[tuple[tuple[str, ...], str, float, str], ...] = (
+#   (keywords meaning "this was requested", functional line, assumption when
+#    NOT requested, confidence, gated)
+#
+# `gated=True` means the capability is only added to the functional list --
+# and therefore only built by planning/implementation, which key off that
+# list -- when the requirement actually asks for it. Silently building a
+# feature nobody requested is scope creep an unattended agent should not
+# commit on its own; the correct move when a capability is unaddressed is to
+# leave it out and record that decision, not build it anyway.
+#
+# `gated=False` describes a property of the system as a whole (there is no
+# way to "not build" persistence, and the no-auth stance is the prototype's
+# baseline either way), so those two are always stated regardless of mention.
+_ASPECTS: tuple[tuple[tuple[str, ...], str, str, float, bool], ...] = (
     (
         ("custom alias", "vanity", "custom short", "custom slug"),
-        "custom aliases are supported as an optional field; a collision is rejected with 409",
-        0.75,
         "accept an optional custom alias for a shortened URL",
+        "custom aliases were not requested; out of scope for this build",
+        0.75,
+        True,
     ),
     (
         ("expir", "ttl", "time to live"),  # "expir" covers expire/expires/expiring/expiration
-        "links do not expire by default; an optional expires_at is accepted and enforced",
-        0.75,
         "support an optional expiration time on a shortened URL",
+        "link expiration was not requested; out of scope for this build",
+        0.75,
+        True,
     ),
     (
         ("auth", "api key", "login", "authenticate", "authorization"),
+        "expose all endpoints without authentication (prototype scope)",
         "no authentication in this prototype; every endpoint is public",
         0.55,
-        "expose all endpoints without authentication (prototype scope)",
+        False,
     ),
     (
         ("analytic", "click count", "stats", "dashboard", "referrer", "geo"),
-        "track click_count and last_accessed_at per link; expose them via a stats endpoint",
-        0.8,
         "record and expose click analytics per shortened URL",
+        "click analytics were not requested; out of scope for this build",
+        0.8,
+        True,
     ),
     (
         ("database", "postgres", "sqlite", "dynamodb", "redis", "storage"),
-        "SQLite backs the prototype behind a repository interface swappable for production scale",
-        0.8,
         "persist shortened URLs and their analytics durably",
+        "SQLite backs the prototype behind a repository interface swappable for "
+        "production scale",
+        0.8,
+        False,
     ),
     (
         ("rate limit", "throttle", "abuse", "reliability", "resilien"),
-        "a simple in-memory fixed-window rate limiter guards the create endpoint per client IP",
-        0.6,
         "rate-limit URL creation to protect the service from abuse",
+        "rate limiting was not requested; out of scope for this build -- note: an "
+        "unlimited create endpoint is a reliability and abuse risk (see the security review)",
+        0.6,
+        True,
     ),
 )
 
@@ -207,31 +227,49 @@ class RequirementsAgent(Agent):
         ambiguities: list[Ambiguity] = []
         decisions = []
 
-        for keywords, assumption, confidence, functional_line in _ASPECTS:
+        for keywords, functional_line, assumption, confidence, gated in _ASPECTS:
             mentioned = any(k in text for k in keywords)
-            functional.append(functional_line)
-            if not mentioned:
-                assumptions.append(assumption)
-                ambiguities.append(
-                    Ambiguity(
-                        question=f"the requirement does not specify: {functional_line}?",
-                        why_it_matters=(
-                            "downstream design and implementation need a concrete answer"
-                        ),
-                        assumption=assumption,
-                        confidence=confidence,
-                        blocking=False,
-                    )
+
+            if mentioned or not gated:
+                functional.append(functional_line)
+            if mentioned:
+                continue
+
+            assumptions.append(assumption)
+            question = (
+                f"the requirement does not specify: {functional_line}?"
+                if gated
+                else f"the requirement does not specify a detail of: {functional_line}?"
+            )
+            ambiguities.append(
+                Ambiguity(
+                    question=question,
+                    why_it_matters=(
+                        "an unattended agent must not silently expand scope to include a "
+                        "capability nobody asked for"
+                        if gated
+                        else "downstream design and implementation need a concrete default"
+                    ),
+                    assumption=assumption,
+                    confidence=confidence,
+                    blocking=False,
                 )
-                decisions.append(
-                    self.decision(
-                        functional_line,
-                        assumption,
-                        "not addressed in the requirement text; proceeding on a documented, "
-                        "low-risk default rather than blocking on it",
-                        confidence=confidence,
-                    )
+            )
+            decisions.append(
+                self.decision(
+                    functional_line,
+                    assumption,
+                    "not addressed in the requirement text; "
+                    + (
+                        "left out of scope rather than built unrequested -- a human can "
+                        "ask for it explicitly in a follow-up requirement"
+                        if gated
+                        else "proceeding on a documented, low-risk default rather than "
+                        "blocking on it"
+                    ),
+                    confidence=confidence,
                 )
+            )
 
         risk = RiskLevel.MEDIUM
         domain_hits = len(set(m.lower() for m in _DOMAIN_TERMS.findall(text)))

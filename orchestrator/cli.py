@@ -2,11 +2,18 @@
 
 This is deliberately thin: every command builds the same `Engine` +
 `build_graph()` + `build_agents()` wiring that Phase 4's agents and Phase 2's
-engine already prove correct in isolation. The CLI's only job is to turn
-process arguments into a `Requirement`, run it, print something a human can
-act on, and -- for `build` -- materialize the result into a real directory on
-disk, which is what makes "runnable end-to-end prototype" true of the actual
-generated service rather than just of the orchestrator itself.
+engine already prove correct in isolation. Four commands, each a different
+facet of controlled autonomy:
+
+  build    -- run the full pipeline once, materialize the result.
+  status   -- inspect a persisted run without touching it.
+  resume   -- answer a pending human approval checkpoint and continue.
+  clarify  -- answer a blocking ambiguity and retry from requirements.
+
+`status`/`resume`/`clarify` all reload a run from exactly what `build` left
+on disk (`state.json`, the ledger, the workspace) -- proving the run is
+genuinely resumable across process boundaries, not just within one Python
+call stack.
 """
 
 from __future__ import annotations
@@ -22,8 +29,13 @@ from rich.table import Table
 from orchestrator.agents import build_graph, make_executor
 from orchestrator.config import AutonomyLevel, OrchestratorConfig
 from orchestrator.contracts import Requirement, ScenarioKind, new_id
-from orchestrator.core.approvals import AutoApproveProvider
+from orchestrator.core.approvals import (
+    ApprovalResponse,
+    AutoApproveProvider,
+    CallbackApprovalProvider,
+)
 from orchestrator.core.engine import Engine
+from orchestrator.core.ledger import Ledger
 from orchestrator.core.metrics import ReliabilityReport
 from orchestrator.core.state import RunState, RunStatus
 from orchestrator.core.workspace import Workspace
@@ -62,7 +74,12 @@ def build(
         "(for a brownfield run)."
     ),
 ) -> None:
-    """Run the full nine-stage SDLC pipeline and materialize the result into OUT."""
+    """Run the full nine-stage SDLC pipeline and materialize the result into OUT.
+
+    If the run halts on an approval checkpoint or a blocking ambiguity, its
+    run id is printed; use `asdlc resume` or `asdlc clarify` with that id to
+    continue it later without starting over.
+    """
     exit_code = asyncio.run(
         _build(statement, title, kind, out, autonomy, auto_approve, interactive, seed)
     )
@@ -85,49 +102,149 @@ async def _build(
         f"[bold]provider:[/bold] {provider.name}  [bold]autonomy:[/bold] {autonomy.value}"
     )
 
+    # `new_id` rather than a fixed name derived from --kind: reusing a run id would
+    # append fresh, seq-0-starting ledger events onto a previous run's ledger file,
+    # corrupting its hash chain.
+    run_id = new_id(f"cli-{ScenarioKind(kind).value}")
+    console.print(f"[dim]run id: {run_id}[/dim]")
+
     # Constructed explicitly (never left for Engine's own `workspace or Workspace(...)`
     # fallback) so the exact same object is bound to both the engine and the agents --
     # otherwise an agent that needs to read the workspace (ArchitectureAgent for
     # brownfield reasoning, TestingAgent to actually run pytest) would be looking at
     # an empty stand-in while the engine writes artifacts somewhere else entirely.
-    #
-    # `new_id` rather than a fixed name derived from --kind: reusing a run id would
-    # append fresh, seq-0-starting ledger events onto a previous run's ledger file,
-    # corrupting its hash chain.
-    run_id = new_id(f"cli-{ScenarioKind(kind).value}")
     workspace = Workspace(
         cfg.run_root / run_id / "workspace", seed_from=seed if seed else None
     )
     graph = build_graph()
     executor = make_executor(provider, workspace=workspace)
     engine = Engine(graph, executor, config=cfg, workspace=workspace, run_id=run_id)
-
-    if interactive:
-        engine.approval_provider = _TerminalApprovalProvider(console)
-    elif auto_approve:
-        engine.approval_provider = AutoApproveProvider()
-    # else: leave the engine's own AutoApproveProvider default in place is wrong for
-    # a deliberately non-approving run -- but a locked-down demo without
-    # --interactive has no human to ask, so default to auto-approve.
+    _set_approval_provider(engine, auto_approve=auto_approve, interactive=interactive)
 
     req = Requirement(title=title, statement=statement, kind=kind)
     state = await engine.run(RunState(run_id=run_id, requirement=req))
 
+    return _report_and_promote(engine, state, out)
+
+
+@app.command()
+def status(
+    run_id: str = typer.Argument(..., help="A run id printed by a previous command."),
+) -> None:
+    """Show a persisted run's stage table, findings and any pending approvals."""
+    engine, state = _reload(run_id)
     _print_stage_table(engine, state)
     _print_findings(state)
     _print_metrics(engine.metrics(state))
+    pending = state.approval_log.pending()
+    if pending:
+        console.print("[yellow]pending approval(s):[/yellow]")
+        for request in pending:
+            console.print(request.brief())
 
-    if state.status is not RunStatus.SUCCEEDED:
-        console.print(
-            f"[yellow]run ended in {state.status.value} "
-            f"({state.halt_reason.value if state.halt_reason else 'n/a'}); "
-            f"nothing promoted[/yellow]"
-        )
+
+@app.command()
+def resume(
+    run_id: str = typer.Argument(..., help="A run id printed by a previous command."),
+    approve: bool = typer.Option(
+        True, "--approve/--reject", help="Grant or reject the pending approval checkpoint."
+    ),
+    note: str = typer.Option("", "--note", help="Reviewer note recorded with the decision."),
+    out: Path = typer.Option(Path("target"), "--out"),
+) -> None:
+    """Answer a pending human approval checkpoint and continue a halted run."""
+    exit_code = asyncio.run(_resume(run_id, approve, note, out))
+    raise typer.Exit(code=exit_code)
+
+
+async def _resume(run_id: str, approve: bool, note: str, out: Path) -> int:
+    engine, state = _reload(run_id)
+    if not state.approval_log.pending():
+        console.print(f"[yellow]run {run_id} has no pending approval[/yellow]")
         return 1
 
-    _promote(engine.workspace, out)
-    console.print(f"[green]materialized to {out}/[/green] -- see {out}/README.md to run it")
-    return 0
+    engine.approval_provider = CallbackApprovalProvider(
+        lambda request: ApprovalResponse(
+            request_id=request.id, granted=approve, approver="cli-user", note=note
+        )
+    )
+    state = await engine.resume(state)
+    return _report_and_promote(engine, state, out)
+
+
+@app.command()
+def clarify(
+    run_id: str = typer.Argument(..., help="A run id printed by a previous command."),
+    statement: str = typer.Argument(
+        ..., help="The complete, clarified requirement statement -- replaces the original, "
+        "it is not appended to it."
+    ),
+    out: Path = typer.Option(Path("target"), "--out"),
+) -> None:
+    """Replace a blocked run's requirement with a clarified statement and retry.
+
+    Use this after `asdlc status` shows a blocking ambiguity: the requirements
+    stage re-runs against the new statement, and every stage the ambiguity had
+    blocked gets another chance once it produces an unambiguous normalized
+    requirement. The new statement replaces the old one rather than appending
+    to it, since a vague marker like "TBD" left in the text would otherwise
+    keep tripping the same ambiguity check.
+    """
+    exit_code = asyncio.run(_clarify(run_id, statement, out))
+    raise typer.Exit(code=exit_code)
+
+
+async def _clarify(run_id: str, statement: str, out: Path) -> int:
+    engine, state = _reload(run_id)
+    if state.status is RunStatus.SUCCEEDED:
+        console.print(f"[yellow]run {run_id} already succeeded; nothing to clarify[/yellow]")
+        return 1
+
+    engine.approval_provider = AutoApproveProvider()
+    state.requirement = state.requirement.model_copy(update={"statement": statement})
+    state = await engine.retry_stage(state, "requirements")
+    return _report_and_promote(engine, state, out)
+
+
+# -- shared plumbing ---------------------------------------------------------
+
+
+def _set_approval_provider(engine: Engine, *, auto_approve: bool, interactive: bool) -> None:
+    if interactive:
+        engine.approval_provider = _TerminalApprovalProvider(console)
+    elif auto_approve:
+        engine.approval_provider = AutoApproveProvider()
+    else:
+        # `--no-auto-approve` without `--interactive`: a locked-down run with no
+        # one to ask. Must not silently fall back to Engine's own default
+        # provider, which is itself an AutoApproveProvider -- that would make
+        # `--no-auto-approve` a no-op. Returning None from `decide` is the
+        # documented "pending" signal, so the run genuinely halts and waits.
+        engine.approval_provider = CallbackApprovalProvider(lambda request: None)
+
+
+def _reload(run_id: str) -> tuple[Engine, RunState]:
+    """Reconstruct the exact engine + state a previous `build`/`resume`/
+    `clarify` left on disk: same workspace directory (not re-seeded -- its
+    content *is* the state), same ledger file (loaded, not replaced, so its
+    hash chain extends rather than restarts)."""
+    cfg = OrchestratorConfig.from_env()
+    provider = get_provider(cfg)
+    run_dir = cfg.run_root / run_id
+    state_path = run_dir / "state.json"
+    if not state_path.exists():
+        console.print(f"[red]no run found at {run_dir}[/red]")
+        raise typer.Exit(code=1)
+
+    state = RunState.load(state_path)
+    workspace = Workspace(run_dir / "workspace")
+    ledger = Ledger.load(run_id, path=run_dir / "ledger.jsonl")
+    graph = build_graph()
+    executor = make_executor(provider, workspace=workspace)
+    engine = Engine(
+        graph, executor, config=cfg, workspace=workspace, ledger=ledger, run_id=run_id
+    )
+    return engine, state
 
 
 class _TerminalApprovalProvider(AutoApproveProvider):
@@ -139,8 +256,6 @@ class _TerminalApprovalProvider(AutoApproveProvider):
         self.console = console
 
     async def decide(self, request):
-        from orchestrator.core.approvals import ApprovalResponse
-
         self.console.print(request.brief())
         answer = typer.confirm("Approve?", default=True)
         note = typer.prompt("Note (optional)", default="", show_default=False)
@@ -162,6 +277,24 @@ def _promote(workspace: Workspace, out: Path) -> None:
     shutil.copytree(
         workspace.root, out, ignore=shutil.ignore_patterns("__pycache__", "*.db", "*.pyc")
     )
+
+
+def _report_and_promote(engine: Engine, state: RunState, out: Path) -> int:
+    _print_stage_table(engine, state)
+    _print_findings(state)
+    _print_metrics(engine.metrics(state))
+
+    if state.status is not RunStatus.SUCCEEDED:
+        console.print(
+            f"[yellow]run ended in {state.status.value} "
+            f"({state.halt_reason.value if state.halt_reason else 'n/a'}); "
+            f"nothing promoted -- run id: {state.run_id}[/yellow]"
+        )
+        return 1
+
+    _promote(engine.workspace, out)
+    console.print(f"[green]materialized to {out}/[/green] -- see {out}/README.md to run it")
+    return 0
 
 
 def _print_stage_table(engine: Engine, state: RunState) -> None:

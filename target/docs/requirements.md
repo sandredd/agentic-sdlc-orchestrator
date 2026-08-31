@@ -40,9 +40,9 @@
 - the stats endpoint reflects an incremented click_count after a redirect _(verified by integration)_
 
 ## Ambiguities and assumptions
-- **[assumed (confidence 55%)]** the requirement does not specify: expose all endpoints without authentication (prototype scope)?
-  - why it matters: downstream design and implementation need a concrete answer
+- **[assumed (confidence 55%)]** the requirement does not specify a detail of: expose all endpoints without authentication (prototype scope)?
+  - why it matters: downstream design and implementation need a concrete default
   - assumption: no authentication in this prototype; every endpoint is public
-- **[assumed (confidence 80%)]** the requirement does not specify: persist shortened URLs and their analytics durably?
-  - why it matters: downstream design and implementation need a concrete answer
+- **[assumed (confidence 80%)]** the requirement does not specify a detail of: persist shortened URLs and their analytics durably?
+  - why it matters: downstream design and implementation need a concrete default
   - assumption: SQLite backs the prototype behind a repository interface swappable for production scale

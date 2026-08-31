@@ -297,3 +297,75 @@ async def test_governance_checkpoint_logs_exactly_one_request(make_engine):
     requested = engine.ledger.of_type(EventType.APPROVAL_REQUESTED)
     assert len(requested) == 1, "the checkpoint must not double-log its own request"
     assert len(state.approval_log.requests) == 1
+
+
+# -- retry_stage -----------------------------------------------------------
+
+
+class _ToggleGate:
+    """Blocks until `.unlock()` is called, then always allows. Simulates an
+    entry gate whose condition a human has just fixed (e.g. a blocking
+    ambiguity resolved), without monkey-patching a shared class."""
+
+    name = "entry.toggle"
+
+    def __init__(self) -> None:
+        self.unlocked = False
+
+    def unlock(self) -> None:
+        self.unlocked = True
+
+    def check(self, node, state):
+        from orchestrator.core.gates import GateDecision
+
+        if self.unlocked:
+            return GateDecision.allow(self.name, "unlocked")
+        return GateDecision.block(self.name, "still locked")
+
+
+async def test_retry_stage_gives_blocked_stages_another_chance(make_engine):
+    gate = _ToggleGate()
+    graph = StageGraph(
+        [
+            stage("a", entry_gates=(gate,)),
+            stage("b", ("a",), critical=False),
+        ]
+    )
+    ex = RecordingExecutor()
+    engine = make_engine(graph, ex)
+    state = await engine.run(fresh_state())
+    assert state.stage("a").status is StageStatus.BLOCKED
+    assert state.stage("b").status is StageStatus.BLOCKED
+
+    gate.unlock()
+    state = await engine.retry_stage(state, "a")
+
+    assert state.status is RunStatus.SUCCEEDED
+    assert state.stage("a").status is StageStatus.SUCCEEDED
+    assert state.stage("b").status is StageStatus.SUCCEEDED
+
+
+async def test_retry_stage_also_resets_skipped_optional_stages(make_engine):
+    """Regression test: an optional stage bypassed by _settle() because its
+    dependency was unreachable used to stay SKIPPED forever even after
+    retry_stage() fixed that dependency -- only BLOCKED stages were reset."""
+    gate = _ToggleGate()
+    graph = StageGraph(
+        [
+            stage("a", entry_gates=(gate,)),
+            stage("optional_child", ("a",), optional=True, critical=False),
+        ]
+    )
+    ex = RecordingExecutor()
+    engine = make_engine(graph, ex)
+    state = await engine.run(fresh_state())
+    assert state.stage("a").status is StageStatus.BLOCKED
+    assert state.stage("optional_child").status is StageStatus.SKIPPED
+
+    gate.unlock()
+    state = await engine.retry_stage(state, "a")
+
+    assert state.stage("a").status is StageStatus.SUCCEEDED
+    assert state.stage("optional_child").status is StageStatus.SUCCEEDED, (
+        "a SKIPPED stage must get another chance once what doomed it is fixed"
+    )

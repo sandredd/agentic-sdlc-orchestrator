@@ -334,6 +334,60 @@ class Engine:
         self._halt_detail = None
         return await self.run(state)
 
+    async def retry_stage(self, state: RunState, stage_name: str) -> RunState:
+        """Give one stage -- and everything the graph had given up on as
+        BLOCKED -- another chance to run, and resume execution.
+
+        This is a different primitive from :meth:`replan`, which re-queues
+        stages based on a *changed value a successful upstream stage already
+        produced*. Here there is no prior value to diff against: the target
+        stage's own entry gate refused it outright (the canonical case is a
+        blocking ambiguity -- `NoBlockingAmbiguityGate` holds `architecture`
+        and `planning` before either ever reaches the engine's pre-read of
+        its declared `consumes`, so they never registered as consumers of
+        `normalized_requirement` and :func:`compute_scope` has nothing to
+        find). The caller is expected to have already fixed whatever the gate
+        objected to -- e.g. updated `state.requirement` with a human's answer
+        -- before calling this.
+
+        Every currently-BLOCKED stage is reset to PENDING, not just the named
+        one: a stage blocked transitively behind it (blocked because its own
+        dependency was blocked, not because of its own gate) must get the
+        same fresh chance, and :meth:`_settle` will re-block anything that is
+        still genuinely unreachable once dispatch runs again.
+
+        SKIPPED optional stages are reset too, for the same reason: an
+        optional stage bypassed by `_settle` because its own dependency was
+        unreachable (not one that ran and chose to skip itself -- this engine
+        has no such path) is exactly as stale as a BLOCKED one once that
+        dependency becomes reachable again. Leaving it SKIPPED would silently
+        drop it from the rest of the run even after the thing that doomed it
+        is fixed.
+        """
+        stale = {StageStatus.BLOCKED, StageStatus.SKIPPED}
+        reset_names = {stage_name} | {
+            n for n in self.graph.names if state.stage(n).status in stale
+        }
+        for name in reset_names:
+            st = state.stage(name)
+            st.status = StageStatus.PENDING
+            st.attempts = 0
+            st.result = None
+            st.gate_failures = []
+            st.last_error = None
+            st.started_at = None
+            st.ended_at = None
+
+        self.ledger.append(
+            EventType.REPLAN_APPLIED,
+            summary=f"retrying {stage_name} after a blocking condition was resolved",
+            payload={"stage": stage_name, "reset": sorted(reset_names)},
+        )
+
+        self._halt_reason = None
+        self._halt_detail = None
+        return await self.run(state)
+
     # -- dispatch ----------------------------------------------------------
 
     def _pending(self, state: RunState) -> set[str]:

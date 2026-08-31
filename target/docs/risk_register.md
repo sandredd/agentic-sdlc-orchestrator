@@ -17,10 +17,10 @@
 - **[medium] the rate limiter's state is in-process and per-instance**
   - trade-off: avoids an external dependency (Redis) at prototype scale
   - mitigation: not distributed-safe; replace with a shared store before running more than one instance
-- **[low] the requirement does not specify: expose all endpoints without authentication (prototype scope)?**
+- **[low] the requirement does not specify a detail of: expose all endpoints without authentication (prototype scope)?**
   - trade-off: no authentication in this prototype; every endpoint is public
   - mitigation: documented assumption; revisit if usage patterns contradict it
-- **[low] the requirement does not specify: persist shortened URLs and their analytics durably?**
+- **[low] the requirement does not specify a detail of: persist shortened URLs and their analytics durably?**
   - trade-off: SQLite backs the prototype behind a repository interface swappable for production scale
   - mitigation: documented assumption; revisit if usage patterns contradict it
 
