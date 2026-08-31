@@ -68,6 +68,10 @@ class OrchestratorConfig(BaseModel):
     run_deadline_seconds: float = Field(default=900.0, gt=0)
     stage_timeout_seconds: float = Field(default=120.0, gt=0)
 
+    # On safe-stop, in-flight stages get this long to finish cleanly before
+    # they are cancelled. Cancelling mid-write is what makes a stop *unsafe*.
+    safe_stop_grace_seconds: float = Field(default=10.0, ge=0.0)
+
     # A stage that keeps triggering upstream re-planning is a sign of an
     # unstable requirement, not a flaky agent. Cap it so runs terminate.
     max_replans: int = Field(default=2, ge=0, le=10)
