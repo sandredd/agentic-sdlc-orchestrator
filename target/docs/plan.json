@@ -1,0 +1,105 @@
+{
+  "normalized_requirement_id": "nreq_eb320b1b7f36",
+  "tasks": [
+    {
+      "id": "task_cab759ba8cd9",
+      "title": "data model and storage repository",
+      "detail": "SQLite schema + repository interface for URLs",
+      "stage": "implementation",
+      "depends_on": [],
+      "estimate_points": 2,
+      "risk": "low"
+    },
+    {
+      "id": "task_08757ec1fd50",
+      "title": "short-code generation",
+      "detail": "base62 encode/decode with a uniqueness guarantee",
+      "stage": "implementation",
+      "depends_on": [
+        "task_cab759ba8cd9"
+      ],
+      "estimate_points": 1,
+      "risk": "low"
+    },
+    {
+      "id": "task_169846fdd86a",
+      "title": "create endpoint",
+      "detail": "POST /api/urls: validate, generate/accept code, persist",
+      "stage": "implementation",
+      "depends_on": [
+        "task_cab759ba8cd9",
+        "task_08757ec1fd50"
+      ],
+      "estimate_points": 2,
+      "risk": "low"
+    },
+    {
+      "id": "task_aad1569613a0",
+      "title": "redirect endpoint",
+      "detail": "GET /{code}: lookup, increment analytics, 302 or 404/410",
+      "stage": "implementation",
+      "depends_on": [
+        "task_cab759ba8cd9"
+      ],
+      "estimate_points": 2,
+      "risk": "low"
+    },
+    {
+      "id": "task_72d5af9c81a3",
+      "title": "custom alias handling",
+      "detail": "accept custom_alias, enforce uniqueness, 409 on collision",
+      "stage": "implementation",
+      "depends_on": [
+        "task_cab759ba8cd9",
+        "task_169846fdd86a"
+      ],
+      "estimate_points": 1,
+      "risk": "medium"
+    },
+    {
+      "id": "task_f34c4074bbd1",
+      "title": "expiration handling",
+      "detail": "accept/validate expires_at; 410 once passed",
+      "stage": "implementation",
+      "depends_on": [
+        "task_cab759ba8cd9",
+        "task_aad1569613a0"
+      ],
+      "estimate_points": 1,
+      "risk": "medium"
+    },
+    {
+      "id": "task_651a7f270e74",
+      "title": "stats endpoint",
+      "detail": "GET /api/urls/{code}/stats: click_count, last_accessed_at",
+      "stage": "implementation",
+      "depends_on": [
+        "task_cab759ba8cd9",
+        "task_aad1569613a0"
+      ],
+      "estimate_points": 1,
+      "risk": "low"
+    },
+    {
+      "id": "task_0990467abe6f",
+      "title": "rate limiting middleware",
+      "detail": "fixed-window limiter on the create endpoint",
+      "stage": "implementation",
+      "depends_on": [
+        "task_169846fdd86a"
+      ],
+      "estimate_points": 2,
+      "risk": "medium"
+    },
+    {
+      "id": "task_338d206e5f0f",
+      "title": "auth scaffolding note",
+      "detail": "document the no-auth prototype boundary explicitly",
+      "stage": "implementation",
+      "depends_on": [],
+      "estimate_points": 1,
+      "risk": "medium"
+    }
+  ],
+  "sequencing_rationale": "core CRUD/redirect tasks are unconditional; optional tasks (custom alias, expiration, analytics, rate limiting) are included only when the normalized functional requirements call for them, so a narrow brownfield change gets a narrow plan rather than the full greenfield build-out. Storage and code generation are sequenced first because every endpoint depends on them."
+}

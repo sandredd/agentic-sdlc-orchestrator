@@ -73,7 +73,8 @@ docs/_build/
 
 # PyBuilder
 .pybuilder/
-target/
+# NOTE: not "target/" -- that's this project's committed, generated deliverable
+# (the URL shortener produced by `asdlc build`), not a PyBuilder output dir.
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -222,3 +223,7 @@ __marimo__/
 .venv/
 .idea/
 build.md
+
+# Materialized target app runtime data
+target/*.db
+shortener.db

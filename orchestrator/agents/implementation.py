@@ -56,6 +56,9 @@ class ImplementationAgent(Agent):
                 self.artifact("app/middleware.py", ArtifactKind.CODE, _middleware_py())
             )
         artifacts.append(self.artifact("app/main.py", ArtifactKind.CODE, _main_py(caps)))
+        artifacts.append(
+            self.artifact("requirements.txt", ArtifactKind.CONFIG, _requirements_txt())
+        )
 
         decision = self.decision(
             "which optional capabilities are implemented?",
@@ -72,6 +75,13 @@ class ImplementationAgent(Agent):
             decisions=(decision,),
             context={"code": {"files": [a.path for a in artifacts], "capabilities": caps}},
         )
+
+
+def _requirements_txt() -> str:
+    return """fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+"""
 
 
 def _config_py() -> str:

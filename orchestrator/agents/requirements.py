@@ -235,8 +235,13 @@ class RequirementsAgent(Agent):
 
         risk = RiskLevel.MEDIUM
         domain_hits = len(set(m.lower() for m in _DOMAIN_TERMS.findall(text)))
+        # A short statement is not by itself a sign of ambiguity -- "Build a URL
+        # shortener" is four words and completely unambiguous about what to
+        # build. What actually signals a missing decision is a short statement
+        # that names *no* domain vocabulary at all ("make it better"), which is
+        # why this checks domain_hits == 0 rather than merely "few".
         is_vague = bool(_VAGUE_MARKERS.search(req.statement)) or (
-            len(text.split()) < 12 and domain_hits <= 2
+            len(text.split()) < 12 and domain_hits == 0
         )
         if is_vague:
             question = (

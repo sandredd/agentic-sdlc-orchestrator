@@ -36,11 +36,14 @@ class SecurityAgent(Agent):
         # none): catches an issue that only exists in combination, e.g. a
         # PII-in-logs pattern in one file and a logging call in another that
         # the per-stage exit check never saw side by side.
+        #
+        # Evaluated as a single batch, not one artifact at a time: a rule
+        # like TestsAccompanyCodeRule reasons about the *set* of code
+        # artifacts ("N files, no tests among them"), and calling it once per
+        # artifact would report the same gap N times over instead of once.
         policy = PolicyEngine.default()
-        findings = []
-        for artifact in state.artifacts.values():
-            single = StageResult(stage=node.name, artifacts=(artifact,))
-            findings.extend(policy.evaluate(node, state, single))
+        batch = StageResult(stage=node.name, artifacts=tuple(state.artifacts.values()))
+        findings = list(policy.evaluate(node, state, batch))
 
         cross_cutting = self._cross_cutting_review(caps)
         findings.extend(cross_cutting)
