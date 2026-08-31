@@ -111,37 +111,23 @@ MIN_CODE_LENGTH = 6
 
 
 def _codec_py() -> str:
-    return '''"""Base62 short-code generation.
+    return '''"""Random short-code generation.
 
-A monotonic row id is encoded rather than drawing a random token: it makes
-every code unique by construction, so the hot create path never needs a
-collision-retry loop. Codes are offset by a fixed power of the base so early
-ids ("1", "2", ...) still decode to a minimum length instead of looking
-suspiciously short next to later ones -- the same trick as zero-padding in
-base 10, where offsetting by 10**(n-1) is what keeps a 6-digit field from
-ever showing fewer than 6 digits.
+A random token, not an encoding of the row id: encoding the id was
+considered (and rejected) specifically because it makes every code
+enumerable -- given one code, incrementing it walks every other link the
+service has ever created, with no auth in front of any of it. `secrets`
+rather than `random`: a short code is effectively a bearer credential for
+whatever it points to, not merely a display value.
 """
 
+import secrets
+
 _ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-_BASE = len(_ALPHABET)
 
 
-def encode(n: int, min_length: int = 6) -> str:
-    if n < 0:
-        raise ValueError("cannot encode a negative id")
-    offset = n + _BASE ** (min_length - 1)
-    digits = []
-    while offset:
-        offset, rem = divmod(offset, _BASE)
-        digits.append(_ALPHABET[rem])
-    return "".join(reversed(digits))
-
-
-def decode(code: str, min_length: int = 6) -> int:
-    n = 0
-    for ch in code:
-        n = n * _BASE + _ALPHABET.index(ch)
-    return n - _BASE ** (min_length - 1)
+def random_code(length: int = 6) -> str:
+    return "".join(secrets.choice(_ALPHABET) for _ in range(length))
 '''
 
 
@@ -206,8 +192,10 @@ def init_db() -> None:
 
 
 def insert(code: str, long_url: str, created_at: str, **extra) -> int:
-    """Insert a row. `code` may be empty for a row whose code is derived from
-    its own id after insertion (see `assign_generated_code`)."""
+    """Insert a row. The caller is responsible for having already picked a
+    unique `code` (see `routes._generate_unique_code`) -- this layer does not
+    generate or retry on its own, so persistence stays a thin wrapper over
+    SQL rather than a place business logic like collision handling hides."""
     columns = ["code", "long_url", "created_at", *extra.keys()]
     placeholders = ", ".join("?" for _ in columns)
     values = [code, long_url, created_at, *extra.values()]
@@ -216,11 +204,6 @@ def insert(code: str, long_url: str, created_at: str, **extra) -> int:
             f"INSERT INTO urls ({', '.join(columns)}) VALUES ({placeholders})", values
         )
         return cur.lastrowid
-
-
-def assign_generated_code(row_id: int, code: str) -> None:
-    with cursor() as cur:
-        cur.execute("UPDATE urls SET code = ? WHERE id = ?", (code, row_id))
 
 
 def get_by_code(code: str) -> sqlite3.Row | None:
@@ -364,15 +347,13 @@ def _routes_py(caps: dict[str, bool]) -> str:
         code = payload.custom_alias
         storage.insert(code, str(payload.long_url), now, is_custom_alias=1__EXTRA_KW__)
     else:
-        row_id = storage.insert("", str(payload.long_url), now, is_custom_alias=0__EXTRA_KW__)
-        code = codec.encode(row_id, MIN_CODE_LENGTH)
-        storage.assign_generated_code(row_id, code)
+        code = _generate_unique_code()
+        storage.insert(code, str(payload.long_url), now, is_custom_alias=0__EXTRA_KW__)
 '''
     else:
         create_body = '''
-    row_id = storage.insert("", str(payload.long_url), now__EXTRA_KW__)
-    code = codec.encode(row_id, MIN_CODE_LENGTH)
-    storage.assign_generated_code(row_id, code)
+    code = _generate_unique_code()
+    storage.insert(code, str(payload.long_url), now__EXTRA_KW__)
 '''
     create_body = create_body.replace("__EXTRA_KW__", expiry_extra_kw)
 
@@ -423,9 +404,27 @@ from app.models import CreateUrlRequest, StatsResponse, UrlResponse
 
 router = APIRouter()
 
+_MAX_CODE_ATTEMPTS = 10
+
 
 def _utcnow_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _generate_unique_code() -> str:
+    """A random code, retried on the rare collision. Bounded rather than an
+    unbounded `while True`: at 62**6 (~5.7e10) possible codes a collision on
+    the first attempt is already astronomically unlikely, so hitting this
+    limit means something is actually wrong (a near-exhausted code space, or
+    a broken random source) and should surface as an error, not hang.
+    """
+    for _ in range(_MAX_CODE_ATTEMPTS):
+        code = codec.random_code(MIN_CODE_LENGTH)
+        if not storage.code_exists(code):
+            return code
+    raise HTTPException(
+        status_code=503, detail="could not generate a unique code, please retry"
+    )
 
 
 @router.post("/api/urls", response_model=UrlResponse, status_code=201)

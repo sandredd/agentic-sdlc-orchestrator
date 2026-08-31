@@ -54,8 +54,10 @@ def init_db() -> None:
 
 
 def insert(code: str, long_url: str, created_at: str, **extra) -> int:
-    """Insert a row. `code` may be empty for a row whose code is derived from
-    its own id after insertion (see `assign_generated_code`)."""
+    """Insert a row. The caller is responsible for having already picked a
+    unique `code` (see `routes._generate_unique_code`) -- this layer does not
+    generate or retry on its own, so persistence stays a thin wrapper over
+    SQL rather than a place business logic like collision handling hides."""
     columns = ["code", "long_url", "created_at", *extra.keys()]
     placeholders = ", ".join("?" for _ in columns)
     values = [code, long_url, created_at, *extra.values()]
@@ -64,11 +66,6 @@ def insert(code: str, long_url: str, created_at: str, **extra) -> int:
             f"INSERT INTO urls ({', '.join(columns)}) VALUES ({placeholders})", values
         )
         return cur.lastrowid
-
-
-def assign_generated_code(row_id: int, code: str) -> None:
-    with cursor() as cur:
-        cur.execute("UPDATE urls SET code = ? WHERE id = ?", (code, row_id))
 
 
 def get_by_code(code: str) -> sqlite3.Row | None:

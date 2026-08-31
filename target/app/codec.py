@@ -1,31 +1,17 @@
-"""Base62 short-code generation.
+"""Random short-code generation.
 
-A monotonic row id is encoded rather than drawing a random token: it makes
-every code unique by construction, so the hot create path never needs a
-collision-retry loop. Codes are offset by a fixed power of the base so early
-ids ("1", "2", ...) still decode to a minimum length instead of looking
-suspiciously short next to later ones -- the same trick as zero-padding in
-base 10, where offsetting by 10**(n-1) is what keeps a 6-digit field from
-ever showing fewer than 6 digits.
+A random token, not an encoding of the row id: encoding the id was
+considered (and rejected) specifically because it makes every code
+enumerable -- given one code, incrementing it walks every other link the
+service has ever created, with no auth in front of any of it. `secrets`
+rather than `random`: a short code is effectively a bearer credential for
+whatever it points to, not merely a display value.
 """
 
+import secrets
+
 _ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-_BASE = len(_ALPHABET)
 
 
-def encode(n: int, min_length: int = 6) -> str:
-    if n < 0:
-        raise ValueError("cannot encode a negative id")
-    offset = n + _BASE ** (min_length - 1)
-    digits = []
-    while offset:
-        offset, rem = divmod(offset, _BASE)
-        digits.append(_ALPHABET[rem])
-    return "".join(reversed(digits))
-
-
-def decode(code: str, min_length: int = 6) -> int:
-    n = 0
-    for ch in code:
-        n = n * _BASE + _ALPHABET.index(ch)
-    return n - _BASE ** (min_length - 1)
+def random_code(length: int = 6) -> str:
+    return "".join(secrets.choice(_ALPHABET) for _ in range(length))

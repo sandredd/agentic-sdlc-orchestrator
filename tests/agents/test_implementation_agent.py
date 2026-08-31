@@ -32,15 +32,33 @@ def test_every_capability_combination_produces_valid_python(caps):
         ast.parse(content)  # raises SyntaxError on failure
 
 
-def test_codec_roundtrips_and_is_monotonic_length_stable():
+def test_random_code_has_correct_length_and_charset():
     from orchestrator.agents.implementation import _codec_py
 
     ns: dict = {}
     exec(compile(_codec_py(), "<codec>", "exec"), ns)
-    encode, decode = ns["encode"], ns["decode"]
-    for n in (0, 1, 61, 62, 1000, 999999):
-        assert decode(encode(n)) == n
-    assert len(encode(0)) == len(encode(1)) == 6
+    random_code = ns["random_code"]
+    alphabet = set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+
+    codes = [random_code() for _ in range(200)]
+    assert all(len(c) == 6 for c in codes)
+    assert all(set(c) <= alphabet for c in codes)
+
+
+def test_random_code_is_not_sequential():
+    """Regression test, reported directly: the previous id-encoding scheme
+    produced strictly incrementing codes (100001, 100002, ...), making every
+    link enumerable with no auth in front of the service. A random source
+    must not reproduce that pattern."""
+    from orchestrator.agents.implementation import _codec_py
+
+    ns: dict = {}
+    exec(compile(_codec_py(), "<codec>", "exec"), ns)
+    random_code = ns["random_code"]
+
+    codes = [random_code() for _ in range(50)]
+    assert len(set(codes)) == len(codes), "50 samples collided -- not exercising real randomness"
+    assert codes != sorted(codes), "codes must not come out in a predictable, incrementing order"
 
 
 async def test_agent_gates_optional_files_on_plan(provider, node):

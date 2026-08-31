@@ -10,8 +10,8 @@
   - not addressed in the requirement text; proceeding on a documented, low-risk default rather than blocking on it
 - **[planning] how is the requirement decomposed into implementation tasks?** -> 9 task(s), 13 point(s) total
   - core CRUD/redirect tasks are unconditional; optional tasks (custom alias, expiration, analytics, rate limiting) are included only when the normalized functional requirements call for them, so a narrow brownfield change gets a narrow plan rather than the full greenfield build-out. Storage and code generation are sequenced first because every endpoint depends on them.
-- **[architecture] how should short codes be generated?** -> base62-encoded auto-increment row id, 6+ characters, collision-checked on custom alias only
-  - monotonic ids avoid a random-collision retry loop on the hot create path; base62 keeps codes short and URL-safe
+- **[architecture] how should short codes be generated?** -> random base62 token, 6 characters, bounded collision-retry on both the generated case and a caller-supplied custom alias
+  - an id-derived encoding was considered and rejected: it makes every code enumerable -- given one code, incrementing it walks every link the service has ever created, with no auth in front of any of it. A random token costs one extra existence check per create (collisions are astronomically rare at 62**6 codes) in exchange for codes that reveal nothing about each other
 - **[architecture] how is persistence structured?** -> a single SQLite table behind a repository interface (`Storage` protocol)
   - the requirement did not mandate a specific database; SQLite needs no external service for a prototype, and the repository interface is what makes swapping to Postgres later a config change, not a rewrite
 - **[architecture] how is create-endpoint abuse mitigated?** -> in-memory fixed-window rate limiter, per client IP, applied as ASGI middleware

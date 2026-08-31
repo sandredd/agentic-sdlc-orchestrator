@@ -3,9 +3,9 @@
 ## Key decisions
 
 ### how should short codes be generated?
-**Choice:** base62-encoded auto-increment row id, 6+ characters, collision-checked on custom alias only
-**Rationale:** monotonic ids avoid a random-collision retry loop on the hot create path; base62 keeps codes short and URL-safe
-**Alternatives considered:** random token + collision retry, hash of the long URL (not unique)
+**Choice:** random base62 token, 6 characters, bounded collision-retry on both the generated case and a caller-supplied custom alias
+**Rationale:** an id-derived encoding was considered and rejected: it makes every code enumerable -- given one code, incrementing it walks every link the service has ever created, with no auth in front of any of it. A random token costs one extra existence check per create (collisions are astronomically rare at 62**6 codes) in exchange for codes that reveal nothing about each other
+**Alternatives considered:** base62-encoded auto-increment row id (rejected: enumerable), hash of the long URL (not unique)
 
 ### how is persistence structured?
 **Choice:** a single SQLite table behind a repository interface (`Storage` protocol)

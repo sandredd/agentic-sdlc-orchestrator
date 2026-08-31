@@ -14,9 +14,27 @@ from app.models import CreateUrlRequest, StatsResponse, UrlResponse
 
 router = APIRouter()
 
+_MAX_CODE_ATTEMPTS = 10
+
 
 def _utcnow_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _generate_unique_code() -> str:
+    """A random code, retried on the rare collision. Bounded rather than an
+    unbounded `while True`: at 62**6 (~5.7e10) possible codes a collision on
+    the first attempt is already astronomically unlikely, so hitting this
+    limit means something is actually wrong (a near-exhausted code space, or
+    a broken random source) and should surface as an error, not hang.
+    """
+    for _ in range(_MAX_CODE_ATTEMPTS):
+        code = codec.random_code(MIN_CODE_LENGTH)
+        if not storage.code_exists(code):
+            return code
+    raise HTTPException(
+        status_code=503, detail="could not generate a unique code, please retry"
+    )
 
 
 @router.post("/api/urls", response_model=UrlResponse, status_code=201)
@@ -41,9 +59,8 @@ def create_url(payload: CreateUrlRequest) -> UrlResponse:
         code = payload.custom_alias
         storage.insert(code, str(payload.long_url), now, is_custom_alias=1, expires_at=expires_at_value)
     else:
-        row_id = storage.insert("", str(payload.long_url), now, is_custom_alias=0, expires_at=expires_at_value)
-        code = codec.encode(row_id, MIN_CODE_LENGTH)
-        storage.assign_generated_code(row_id, code)
+        code = _generate_unique_code()
+        storage.insert(code, str(payload.long_url), now, is_custom_alias=0, expires_at=expires_at_value)
 
     row = storage.get_by_code(code)
     return UrlResponse(
