@@ -136,3 +136,46 @@ async def test_startup_prints_every_registered_route_not_just_top_level_ones(
     assert "POST    /api/urls" in output
     assert "GET     /{code}" in output
     assert "GET     /api/urls/{code}" in output
+
+
+async def test_home_page_returns_200_and_lists_real_endpoints(provider, node, tmp_path):
+    """GET / used to 404 -- FastAPI has no default route at the root. Users
+    following the printed run URL (http://127.0.0.1:8000) into a browser had
+    no way to discover the API from there. Verifies against the real running
+    app, not just the template string, since the route table it renders
+    comes from the same `_route_table()` helper the startup log uses."""
+    import sys
+
+    from orchestrator.core.workspace import Workspace
+
+    state = state_for("Build a URL shortener with custom aliases.")
+    state.context.set(
+        "plan", {"tasks": [{"title": "custom alias handling"}]}, writer="planning"
+    )
+    ws = Workspace(tmp_path / "ws")
+    result = await ImplementationAgent(provider).run(node, state)
+    for a in result.artifacts:
+        ws.write_artifact(a)
+
+    sys.path.insert(0, str(ws.root))
+    try:
+        import importlib
+
+        for mod in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
+            del sys.modules[mod]
+
+        from fastapi.testclient import TestClient
+
+        main = importlib.import_module("app.main")
+        with TestClient(main.app) as client:
+            response = client.get("/")
+    finally:
+        sys.path.remove(str(ws.root))
+        for mod in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
+            del sys.modules[mod]
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "/docs" in response.text
+    assert "/api/urls" in response.text
+    assert "/{code}" in response.text
