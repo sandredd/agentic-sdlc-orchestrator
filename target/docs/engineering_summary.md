@@ -6,7 +6,7 @@
 ## Plan and rationale
 - **[requirements] expose all endpoints without authentication (prototype scope)** -> no authentication in this prototype; every endpoint is public
   - not addressed in the requirement text; proceeding on a documented, low-risk default rather than blocking on it
-- **[requirements] persist shortened URLs and their analytics durably** -> SQLite backs the prototype behind a repository interface swappable for production scale
+- **[requirements] persist shortened URL records durably** -> SQLite backs the prototype behind a repository interface swappable for production scale
   - not addressed in the requirement text; proceeding on a documented, low-risk default rather than blocking on it
 - **[planning] how is the requirement decomposed into implementation tasks?** -> 9 task(s), 13 point(s) total
   - core CRUD/redirect tasks are unconditional; optional tasks (custom alias, expiration, analytics, rate limiting) are included only when the normalized functional requirements call for them, so a narrow brownfield change gets a narrow plan rather than the full greenfield build-out. Storage and code generation are sequenced first because every endpoint depends on them.

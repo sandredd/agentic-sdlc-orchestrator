@@ -11,7 +11,7 @@
 - support an optional expiration time on a shortened URL
 - expose all endpoints without authentication (prototype scope)
 - record and expose click analytics per shortened URL
-- persist shortened URLs and their analytics durably
+- persist shortened URL records durably
 - rate-limit URL creation to protect the service from abuse
 
 ## Out of scope
@@ -26,7 +26,7 @@
 - support an optional expiration time on a shortened URL
 - expose all endpoints without authentication (prototype scope)
 - record and expose click analytics per shortened URL
-- persist shortened URLs and their analytics durably
+- persist shortened URL records durably
 - rate-limit URL creation to protect the service from abuse
 
 ## Non-functional requirements
@@ -43,6 +43,6 @@
 - **[assumed (confidence 55%)]** the requirement does not specify a detail of: expose all endpoints without authentication (prototype scope)?
   - why it matters: downstream design and implementation need a concrete default
   - assumption: no authentication in this prototype; every endpoint is public
-- **[assumed (confidence 80%)]** the requirement does not specify a detail of: persist shortened URLs and their analytics durably?
+- **[assumed (confidence 80%)]** the requirement does not specify a detail of: persist shortened URL records durably?
   - why it matters: downstream design and implementation need a concrete default
   - assumption: SQLite backs the prototype behind a repository interface swappable for production scale

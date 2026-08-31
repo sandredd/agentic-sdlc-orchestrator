@@ -110,7 +110,7 @@ async def test_unrequested_capabilities_are_not_silently_added_to_scope(provider
     assert "click analytics" not in functional_text
     assert "rate-limit" not in functional_text
     # Always-on descriptive properties (not gated capabilities) remain present.
-    assert "persist shortened urls" in functional_text
+    assert "persist shortened url" in functional_text
 
 
 async def test_requested_capability_is_added_to_functional_scope(provider, node):
@@ -122,3 +122,18 @@ async def test_requested_capability_is_added_to_functional_scope(provider, node)
     functional_text = " ".join(nreq["functional"]).lower()
     assert "custom alias" in functional_text
     assert "expiration" not in functional_text
+
+
+async def test_persistence_description_does_not_leak_into_analytics_gate(provider, node):
+    """Regression test: the always-on persistence line used to say '...their
+    analytics durably', and planning gates the stats-endpoint task on the
+    word 'analytic' appearing anywhere in the functional list -- so every
+    build silently built a stats endpoint regardless of whether analytics
+    were requested, purely because of an unrelated always-on sentence."""
+    agent = RequirementsAgent(provider)
+    result = await agent.run(
+        node, state_for("Add expiration support to existing shortened links.")
+    )
+    nreq = result.context_updates["normalized_requirement"]
+    functional_text = " ".join(nreq["functional"]).lower()
+    assert "analytic" not in functional_text

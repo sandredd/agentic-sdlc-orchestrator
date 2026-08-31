@@ -97,7 +97,11 @@ _ASPECTS: tuple[tuple[tuple[str, ...], str, str, float, bool], ...] = (
     ),
     (
         ("database", "postgres", "sqlite", "dynamodb", "redis", "storage"),
-        "persist shortened URLs and their analytics durably",
+        # Deliberately does not say "analytics" -- planning gates the stats-endpoint
+        # task on that exact word appearing anywhere in the functional list, and
+        # this line is always present regardless of whether analytics were asked
+        # for. Using it here would silently build the stats endpoint on every run.
+        "persist shortened URL records durably",
         "SQLite backs the prototype behind a repository interface swappable for "
         "production scale",
         0.8,
