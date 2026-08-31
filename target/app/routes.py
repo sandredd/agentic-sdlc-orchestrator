@@ -23,13 +23,25 @@ def _utcnow_iso() -> str:
 def create_url(payload: CreateUrlRequest) -> UrlResponse:
     now = _utcnow_iso()
 
+    expires_at_value = None
+    if payload.expires_at is not None:
+        expires_at = payload.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= datetime.now(UTC):
+            raise HTTPException(
+                status_code=422, detail="expires_at must be in the future"
+            )
+        expires_at_value = expires_at.isoformat()
+
+
     if payload.custom_alias:
         if storage.code_exists(payload.custom_alias):
             raise HTTPException(status_code=409, detail="alias already in use")
         code = payload.custom_alias
-        storage.insert(code, str(payload.long_url), now, is_custom_alias=1, expires_at=payload.expires_at.isoformat() if payload.expires_at else None)
+        storage.insert(code, str(payload.long_url), now, is_custom_alias=1, expires_at=expires_at_value)
     else:
-        row_id = storage.insert("", str(payload.long_url), now, is_custom_alias=0, expires_at=payload.expires_at.isoformat() if payload.expires_at else None)
+        row_id = storage.insert("", str(payload.long_url), now, is_custom_alias=0, expires_at=expires_at_value)
         code = codec.encode(row_id, MIN_CODE_LENGTH)
         storage.assign_generated_code(row_id, code)
 
@@ -39,6 +51,7 @@ def create_url(payload: CreateUrlRequest) -> UrlResponse:
         short_url=f"{BASE_URL}/{code}",
         long_url=str(payload.long_url),
         created_at=row["created_at"],
+        expires_at=row["expires_at"],
     )
 
 
@@ -48,8 +61,12 @@ def redirect(code: str) -> RedirectResponse:
     if row is None:
         raise HTTPException(status_code=404, detail="unknown code")
 
-    if row["expires_at"] and row["expires_at"] < _utcnow_iso():
-        raise HTTPException(status_code=410, detail="this link has expired")
+    if row["expires_at"]:
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at < datetime.now(UTC):
+            raise HTTPException(status_code=410, detail="this link has expired")
 
     storage.record_click(code, _utcnow_iso())
     return RedirectResponse(url=row["long_url"], status_code=302)
@@ -65,6 +82,7 @@ def get_metadata(code: str) -> UrlResponse:
         short_url=f"{BASE_URL}/{code}",
         long_url=row["long_url"],
         created_at=row["created_at"],
+        expires_at=row["expires_at"],
     )
 
 

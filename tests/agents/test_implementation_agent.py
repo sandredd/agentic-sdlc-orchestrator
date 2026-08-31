@@ -14,7 +14,7 @@ from orchestrator.agents.implementation import (
     _storage_py,
 )
 
-from .conftest import state_for
+from .conftest import materialized_app, state_for
 
 ALL_CAPS = [
     dict(zip(["alias", "expiry", "stats", "rate_limit"], combo, strict=True))
@@ -81,8 +81,25 @@ async def test_pyproject_toml_scopes_pytest_rootdir_to_target(provider, node):
     assert "asyncio_mode" not in by_path["pyproject.toml"].content
 
 
+async def _materialize(provider, node, tmp_path, statement, task_titles):
+    """Run ImplementationAgent for real and write every artifact into a
+    fresh workspace, ready to be imported as a real `app` package via
+    `materialized_app()`."""
+    from orchestrator.core.workspace import Workspace
+
+    state = state_for(statement)
+    state.context.set(
+        "plan", {"tasks": [{"title": t} for t in task_titles]}, writer="planning"
+    )
+    ws = Workspace(tmp_path / "ws")
+    result = await ImplementationAgent(provider).run(node, state)
+    for a in result.artifacts:
+        ws.write_artifact(a)
+    return ws
+
+
 async def test_startup_prints_every_registered_route_not_just_top_level_ones(
-    provider, node, tmp_path
+    provider, node, tmp_path, monkeypatch
 ):
     """Regression test: the route table used to be built by walking
     `app.routes` and filtering to `isinstance(route, APIRoute)`, but a
@@ -97,40 +114,20 @@ async def test_startup_prints_every_registered_route_not_just_top_level_ones(
     catch the bug -- it only manifests once FastAPI actually processes a real
     `include_router` call.
     """
-    import sys
+    import io
+    from contextlib import redirect_stdout
 
-    from orchestrator.core.workspace import Workspace
+    from fastapi.testclient import TestClient
 
-    state = state_for("Build a URL shortener with custom aliases.")
-    state.context.set(
-        "plan", {"tasks": [{"title": "custom alias handling"}]}, writer="planning"
+    ws = await _materialize(
+        provider, node, tmp_path,
+        "Build a URL shortener with custom aliases.", ["custom alias handling"],
     )
-    ws = Workspace(tmp_path / "ws")
-    result = await ImplementationAgent(provider).run(node, state)
-    for a in result.artifacts:
-        ws.write_artifact(a)
-
-    sys.path.insert(0, str(ws.root))
-    try:
-        import importlib
-
-        for mod in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
-            del sys.modules[mod]
-
-        import io
-        from contextlib import redirect_stdout
-
-        from fastapi.testclient import TestClient
-
-        main = importlib.import_module("app.main")
+    with materialized_app(ws.root, tmp_path, monkeypatch) as app:
         buf = io.StringIO()
-        with redirect_stdout(buf), TestClient(main.app):
+        with redirect_stdout(buf), TestClient(app):
             pass
         output = buf.getvalue()
-    finally:
-        sys.path.remove(str(ws.root))
-        for mod in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
-            del sys.modules[mod]
 
     assert "GET     /health" in output
     assert "POST    /api/urls" in output
@@ -138,44 +135,68 @@ async def test_startup_prints_every_registered_route_not_just_top_level_ones(
     assert "GET     /api/urls/{code}" in output
 
 
-async def test_home_page_returns_200_and_lists_real_endpoints(provider, node, tmp_path):
+async def test_home_page_returns_200_and_lists_real_endpoints(
+    provider, node, tmp_path, monkeypatch
+):
     """GET / used to 404 -- FastAPI has no default route at the root. Users
     following the printed run URL (http://127.0.0.1:8000) into a browser had
     no way to discover the API from there. Verifies against the real running
     app, not just the template string, since the route table it renders
     comes from the same `_route_table()` helper the startup log uses."""
-    import sys
+    from fastapi.testclient import TestClient
 
-    from orchestrator.core.workspace import Workspace
-
-    state = state_for("Build a URL shortener with custom aliases.")
-    state.context.set(
-        "plan", {"tasks": [{"title": "custom alias handling"}]}, writer="planning"
+    ws = await _materialize(
+        provider, node, tmp_path,
+        "Build a URL shortener with custom aliases.", ["custom alias handling"],
     )
-    ws = Workspace(tmp_path / "ws")
-    result = await ImplementationAgent(provider).run(node, state)
-    for a in result.artifacts:
-        ws.write_artifact(a)
-
-    sys.path.insert(0, str(ws.root))
-    try:
-        import importlib
-
-        for mod in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
-            del sys.modules[mod]
-
-        from fastapi.testclient import TestClient
-
-        main = importlib.import_module("app.main")
-        with TestClient(main.app) as client:
-            response = client.get("/")
-    finally:
-        sys.path.remove(str(ws.root))
-        for mod in [m for m in sys.modules if m == "app" or m.startswith("app.")]:
-            del sys.modules[mod]
+    with materialized_app(ws.root, tmp_path, monkeypatch) as app, TestClient(app) as client:
+        response = client.get("/")
 
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert "/docs" in response.text
     assert "/api/urls" in response.text
     assert "/{code}" in response.text
+
+
+async def test_expiry_is_validated_at_creation_not_only_at_redirect(
+    provider, node, tmp_path, monkeypatch
+):
+    """Regression test, reported directly: a link created with an
+    already-past expires_at (e.g. a stale example date left over from
+    testing via /docs) used to be silently accepted at creation and only
+    fail with a confusing 'this link has expired' the first time anyone
+    clicked it. Also covers the response bug found investigating this:
+    expires_at was never actually included in the API response, always
+    showing null regardless of what was stored.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from fastapi.testclient import TestClient
+
+    ws = await _materialize(
+        provider, node, tmp_path,
+        "Build a URL shortener with expiration support.", ["expiration handling"],
+    )
+    with materialized_app(ws.root, tmp_path, monkeypatch) as app, TestClient(app) as client:
+        past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+        rejected = client.post(
+            "/api/urls", json={"long_url": "https://example.com/a", "expires_at": past}
+        )
+        assert rejected.status_code == 422, (
+            "creating with an already-past expiry must be rejected at the boundary, "
+            "not silently accepted and left to fail confusingly at redirect time"
+        )
+
+        future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+        created = client.post(
+            "/api/urls", json={"long_url": "https://example.com/b", "expires_at": future}
+        )
+        assert created.status_code == 201
+        assert created.json()["expires_at"] is not None, (
+            "expires_at must be reported back, not silently dropped from the response"
+        )
+
+        code = created.json()["code"]
+        redirected = client.get(f"/{code}", follow_redirects=False)
+        assert redirected.status_code == 302

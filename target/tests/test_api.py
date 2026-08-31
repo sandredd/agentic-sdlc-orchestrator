@@ -66,15 +66,47 @@ def test_custom_alias_is_used_verbatim_and_rejects_a_duplicate(client):
 
 
 def test_expired_link_returns_410(client):
+    # A past expires_at can no longer reach storage through the API (see
+    # test_past_expires_at_is_rejected_at_creation below) -- this simulates
+    # the case the redirect-time check actually exists for: a link that was
+    # valid when created and has since passed its expiry, by inserting
+    # directly through the storage layer rather than the (validating) API.
+    from datetime import UTC, datetime, timedelta
+
+    from app import storage
+
+    past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    storage.insert(
+        "expiredlink", "https://example.com/expired", datetime.now(UTC).isoformat(),
+        expires_at=past,
+    )
+    got = client.get("/expiredlink", follow_redirects=False)
+    assert got.status_code == 410
+
+
+def test_past_expires_at_is_rejected_at_creation(client):
     from datetime import UTC, datetime, timedelta
 
     past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
     r = client.post(
         "/api/urls", json={"long_url": "https://example.com/expired", "expires_at": past}
     )
+    assert r.status_code == 422
+
+
+def test_future_expires_at_is_accepted_and_reported_back(client):
+    from datetime import UTC, datetime, timedelta
+
+    future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+    r = client.post(
+        "/api/urls", json={"long_url": "https://example.com/future", "expires_at": future}
+    )
+    assert r.status_code == 201
+    assert r.json()["expires_at"] is not None
+
     code = r.json()["code"]
     got = client.get(f"/{code}", follow_redirects=False)
-    assert got.status_code == 410
+    assert got.status_code == 302
 
 
 def test_stats_reflect_click_count(client):

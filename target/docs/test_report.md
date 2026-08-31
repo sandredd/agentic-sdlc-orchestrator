@@ -1,9 +1,9 @@
 # Test Report
 
-**Result:** 8 passed, 0 failed
+**Result:** 10 passed, 0 failed
 
 ```
-........                                                                 [100%]
-8 passed in 0.21s
+..........                                                               [100%]
+10 passed in 0.20s
 
 ```

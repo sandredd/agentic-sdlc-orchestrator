@@ -289,11 +289,35 @@ class StatsResponse(BaseModel):
 
 
 def _routes_py(caps: dict[str, bool]) -> str:
-    expiry_extra_kw = (
-        ', expires_at=payload.expires_at.isoformat() if payload.expires_at else None'
-        if caps["expiry"]
-        else ""
-    )
+    if caps["expiry"]:
+        # Validated and normalized to an aware UTC datetime *before* it is
+        # ever stored or compared: comparing ISO strings lexicographically
+        # (the previous approach) only agrees with real time order when both
+        # strings share the same precision and offset representation --
+        # e.g. a naive "2027-01-01T00:00:00" from a client and this service's
+        # own "...+00:00"-suffixed timestamps don't reliably sort against
+        # each other as *strings* even though they compare correctly as
+        # datetimes. Parsing once here means every comparison downstream
+        # (this validation, and the redirect-time expiry check) works on
+        # real datetime objects instead.
+        expiry_validation = '''
+    expires_at_value = None
+    if payload.expires_at is not None:
+        expires_at = payload.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at <= datetime.now(UTC):
+            raise HTTPException(
+                status_code=422, detail="expires_at must be in the future"
+            )
+        expires_at_value = expires_at.isoformat()
+'''
+        expiry_extra_kw = ", expires_at=expires_at_value"
+        expires_at_response_kw = ',\n        expires_at=row["expires_at"]'
+    else:
+        expiry_validation = ""
+        expiry_extra_kw = ""
+        expires_at_response_kw = ""
 
     if caps["alias"]:
         create_body = '''
@@ -317,8 +341,12 @@ def _routes_py(caps: dict[str, bool]) -> str:
 
     expiry_check = (
         '''
-    if row["expires_at"] and row["expires_at"] < _utcnow_iso():
-        raise HTTPException(status_code=410, detail="this link has expired")
+    if row["expires_at"]:
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        if expires_at < datetime.now(UTC):
+            raise HTTPException(status_code=410, detail="this link has expired")
 '''
         if caps["expiry"]
         else ""
@@ -366,13 +394,14 @@ def _utcnow_iso() -> str:
 @router.post("/api/urls", response_model=UrlResponse, status_code=201)
 def create_url(payload: CreateUrlRequest) -> UrlResponse:
     now = _utcnow_iso()
+__EXPIRY_VALIDATION__
 __CREATE_BODY__
     row = storage.get_by_code(code)
     return UrlResponse(
         code=code,
         short_url=f"{BASE_URL}/{code}",
         long_url=str(payload.long_url),
-        created_at=row["created_at"],
+        created_at=row["created_at"]__EXPIRES_AT_KW__,
     )
 
 
@@ -395,7 +424,7 @@ def get_metadata(code: str) -> UrlResponse:
         code=code,
         short_url=f"{BASE_URL}/{code}",
         long_url=row["long_url"],
-        created_at=row["created_at"],
+        created_at=row["created_at"]__EXPIRES_AT_KW__,
     )
 
 
@@ -405,7 +434,9 @@ def delete_url(code: str) -> None:
         raise HTTPException(status_code=404, detail="unknown code")
 __STATS_ROUTE__'''
     return (
-        template.replace("__CREATE_BODY__", create_body)
+        template.replace("__EXPIRY_VALIDATION__", expiry_validation)
+        .replace("__CREATE_BODY__", create_body)
+        .replace("__EXPIRES_AT_KW__", expires_at_response_kw)
         .replace("__EXPIRY_CHECK__", expiry_check)
         .replace("__STATS_ROUTE__", stats_route)
     )

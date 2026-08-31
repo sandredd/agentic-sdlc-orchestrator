@@ -1,6 +1,6 @@
 # Risk Register
 
-**Test status:** 8 passed, 0 failed (ran=True)
+**Test status:** 10 passed, 0 failed (ran=True)
 **Security findings:** 3
 **Overall requirement risk:** medium
 
