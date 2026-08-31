@@ -10,18 +10,42 @@ a :attr:`JoinPolicy.ALL` node — rather than implicitly at every layer edge.
 
 Per-stage transactionality
 --------------------------
-Each stage runs against a workspace snapshot taken immediately before dispatch.
-Artifacts are written so that exit gates can inspect real files, but if a gate
-rejects the result the snapshot is restored and nothing is folded into run
-state. A stage therefore either lands completely or leaves no trace — which is
-what makes retry and rollback safe rather than merely hopeful.
+Each stage runs against a workspace snapshot taken immediately before every
+attempt. Artifacts are written so that exit gates and policy rules can inspect
+real files, but if a gate or a BLOCKER policy finding rejects the result, the
+snapshot is restored and nothing is folded into run state. A stage therefore
+either lands completely or leaves no trace — retry, fallback and rollback all
+build on that guarantee.
+
+Governance pipeline
+--------------------
+A single attempt passes through, in order: the executor, artifact sealing,
+exit gates, universal policy guardrails (security/compliance/change-control —
+evaluated on *every* stage, not opt-in), and an exit-point human approval
+checkpoint derived from autonomy level, declared impact and assessed risk. Any
+stage of this pipeline can reject the attempt; :class:`resilience.classify`
+decides whether that rejection is worth retrying. Retries exhausted, a
+declared :class:`~orchestrator.core.resilience.FallbackStrategy` gets one try
+before the stage is recorded as failed and a cascading rollback invalidates
+any already-run stage coupled to it.
 
 Autonomy boundaries
 -------------------
 An agent returns a :class:`StageResult`; it never mutates :class:`RunState`.
-The engine decides admissibility. Where an agent signals that a human must
-weigh in, the engine's default is to *stop*, not to proceed — an unattended
-system should fail closed.
+The engine decides admissibility. Where a human must weigh in — because the
+agent said so, or because governance requires it — the engine's default is to
+*stop*, not to proceed, and the run is resumable: :meth:`Engine.resume` picks
+a halted approval checkpoint back up once a decision has been recorded,
+without re-invoking the executor. :meth:`Engine.replan` re-queues exactly the
+stages whose consumed context went stale, computed from read attribution
+already kept in :class:`~orchestrator.core.state.ContextStore` — not a
+blanket re-run.
+
+Scope note: governance-derived approval checkpoints are enforced at stage
+*exit* only. Entry-point checkpoints (e.g. approval to even attempt a
+high-impact action) are modelled in :class:`~orchestrator.core.approvals.
+ApprovalPolicy` and are independently testable, but this version of the
+engine does not yet block dispatch on them — see the project limitations.
 """
 
 from __future__ import annotations
@@ -33,9 +57,29 @@ from pathlib import Path
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.contracts import StageOutcome, StageResult, new_id, utcnow
+from orchestrator.core.approvals import (
+    ApprovalPoint,
+    ApprovalPolicy,
+    ApprovalProvider,
+    ApprovalRequest,
+    ApprovalResponse,
+    AutoApproveProvider,
+)
 from orchestrator.core.gates import GateDecision
 from orchestrator.core.graph import StageGraph, StageNode
 from orchestrator.core.ledger import EventType, Ledger
+from orchestrator.core.metrics import ReliabilityReport
+from orchestrator.core.metrics import compute as compute_metrics
+from orchestrator.core.policy import PolicyEngine
+from orchestrator.core.replanning import compute_scope
+from orchestrator.core.resilience import (
+    FailureClass,
+    RetryController,
+    plan_rollback,
+)
+from orchestrator.core.resilience import (
+    classify as classify_failure,
+)
 from orchestrator.core.state import (
     HaltReason,
     RunState,
@@ -58,6 +102,43 @@ class StageRejected(Exception):
         super().__init__("; ".join(f"{d.gate}: {d.reason}" for d in decisions))
 
 
+class PolicyRejected(Exception):
+    """A universal guardrail found a BLOCKER-severity violation."""
+
+    def __init__(self, findings) -> None:
+        self.findings = findings
+        super().__init__("; ".join(f.summary for f in findings))
+
+
+class ApprovalRejected(Exception):
+    """A human (or an automated policy provider) declined the checkpoint."""
+
+    def __init__(self, response: ApprovalResponse) -> None:
+        self.response = response
+        super().__init__(f"rejected by {response.approver}: {response.note}")
+
+
+class ApprovalPending(Exception):
+    """The checkpoint has no decision yet. Not a failure: the attempt's
+    result is preserved so a later :meth:`Engine.resume` can resolve the
+    checkpoint without re-invoking the executor."""
+
+    def __init__(self, request: ApprovalRequest, result: StageResult) -> None:
+        self.request = request
+        self.result = result
+        super().__init__(f"awaiting approval: {request.id}")
+
+
+class StageExhausted(Exception):
+    """Retries and any fallback are exhausted; this wraps the last cause so
+    the resolver does not attempt a second rollback of the same attempt."""
+
+    def __init__(self, cause: BaseException, failure_class: FailureClass) -> None:
+        self.cause = cause
+        self.failure_class = failure_class
+        super().__init__(str(cause))
+
+
 class Engine:
     def __init__(
         self,
@@ -68,6 +149,9 @@ class Engine:
         workspace: Workspace | None = None,
         ledger: Ledger | None = None,
         run_id: str | None = None,
+        policy_engine: PolicyEngine | None = None,
+        approval_provider: ApprovalProvider | None = None,
+        retry_controller: RetryController | None = None,
     ) -> None:
         self.graph = graph
         self.executor = executor
@@ -78,6 +162,11 @@ class Engine:
         self.workspace = workspace or Workspace(run_dir / "workspace")
         self.ledger = ledger or Ledger(self.run_id, path=run_dir / "ledger.jsonl")
         self.state_path = run_dir / "state.json"
+
+        self.policy_engine = policy_engine or PolicyEngine.default()
+        self.approval_provider = approval_provider or AutoApproveProvider()
+        self.approval_policy = ApprovalPolicy(self.config)
+        self.retry_controller = retry_controller or RetryController(self.config.retry)
 
         self._halt_reason: HaltReason | None = None
         self._halt_detail: str | None = None
@@ -99,28 +188,34 @@ class Engine:
     def halting(self) -> bool:
         return self._halt_reason is not None
 
+    def metrics(self, state: RunState) -> ReliabilityReport:
+        return compute_metrics(state, self.ledger)
+
     # -- main loop ---------------------------------------------------------
 
     async def run(self, state: RunState) -> RunState:
+        resuming = state.started_at is not None
         state.run_id = self.run_id
         state.status = RunStatus.RUNNING
-        state.started_at = utcnow()
+        if not resuming:
+            state.started_at = utcnow()
         for name in self.graph.names:
             state.stage(name)
 
         loop = asyncio.get_running_loop()
         self._deadline = loop.time() + self.config.run_deadline_seconds
 
-        self.ledger.append(
-            EventType.RUN_STARTED,
-            summary=state.requirement.title,
-            payload={
-                "requirement_id": state.requirement.id,
-                "kind": state.requirement.kind.value,
-                "stages": list(self.graph.names),
-                "autonomy": self.config.autonomy.value,
-            },
-        )
+        if not resuming:
+            self.ledger.append(
+                EventType.RUN_STARTED,
+                summary=state.requirement.title,
+                payload={
+                    "requirement_id": state.requirement.id,
+                    "kind": state.requirement.kind.value,
+                    "stages": list(self.graph.names),
+                    "autonomy": self.config.autonomy.value,
+                },
+            )
 
         in_flight: dict[str, asyncio.Task[StageResult | None]] = {}
         try:
@@ -146,6 +241,98 @@ class Engine:
             self._finalize(state)
 
         return state
+
+    async def resume(self, state: RunState) -> RunState:
+        """Continue a halted run.
+
+        Any stage sitting in AWAITING_APPROVAL is resolved first, reusing its
+        cached, already-gated-and-policy-checked result rather than
+        re-invoking the executor — an approval decision must not depend on
+        the agent producing byte-identical output twice. If the checkpoint is
+        still unanswered, the run halts again in the same state; the caller
+        is expected to have already ensured the provider has an answer to
+        give (e.g. a human wrote the response file a
+        :class:`~orchestrator.core.approvals.FileApprovalProvider` is
+        watching for).
+        """
+        self._halt_reason = None
+        self._halt_detail = None
+
+        for name in sorted(state.names_with_status(StageStatus.AWAITING_APPROVAL)):
+            node = self.graph[name]
+            stage_state = state.stage(name)
+            result = stage_state.result
+            if result is None:
+                continue
+
+            requirement = self.approval_policy.evaluate(node, state, result, ApprovalPoint.EXIT)
+            response = await self._checkpoint(node, state, result, requirement)
+            if response is None:
+                self._hold_for_approval(node, state, result)
+                continue
+            if not response.granted:
+                self._rollback_stage(node, state, "approval rejected")
+                self._fail_stage(
+                    node,
+                    state,
+                    f"approval rejected by {response.approver}: {response.note}",
+                    halt_reason=HaltReason.APPROVAL_REJECTED,
+                )
+                continue
+            self._succeed_stage(node, state, result)
+
+        return await self.run(state)
+
+    async def replan(
+        self, state: RunState, changed_keys: list[str], *, reason: str = ""
+    ) -> RunState:
+        """Re-queue exactly the stages made stale by a change to upstream
+        context, and resume execution.
+
+        The scope is computed from :class:`ContextStore` read attribution —
+        see :mod:`orchestrator.core.replanning` — so a sibling branch that
+        never touched the changed keys is left untouched.
+        """
+        if state.replan_count >= self.config.max_replans:
+            self.request_stop(
+                HaltReason.REPLAN_LIMIT_REACHED,
+                f"max_replans={self.config.max_replans} reached; "
+                f"requirement may be too unstable for autonomous execution",
+            )
+            self._settle(state)
+            self._finalize(state)
+            return state
+
+        scope = compute_scope(self.graph, state, changed_keys, reason=reason)
+        state.replan_count += 1
+
+        self.ledger.append(
+            EventType.REPLAN_APPLIED,
+            summary=scope.reason,
+            payload={
+                "revision": state.replan_count,
+                "changed_keys": list(changed_keys),
+                "directly_stale": sorted(scope.directly_stale),
+                "transitively_stale": sorted(scope.transitively_stale),
+            },
+        )
+
+        for name in scope.stale:
+            stage_state = state.stage(name)
+            stage_state.status = StageStatus.PENDING
+            stage_state.attempts = 0
+            stage_state.result = None
+            stage_state.gate_failures = []
+            stage_state.last_error = None
+            stage_state.started_at = None
+            stage_state.ended_at = None
+
+        for key in changed_keys:
+            state.context.clear_readers(key)
+
+        self._halt_reason = None
+        self._halt_detail = None
+        return await self.run(state)
 
     # -- dispatch ----------------------------------------------------------
 
@@ -174,16 +361,7 @@ class Engine:
 
             stage_state.status = StageStatus.RUNNING
             stage_state.started_at = utcnow()
-            stage_state.attempts += 1
-            snapshot = self.workspace.snapshot(f"pre:{name}")
-            stage_state.snapshot_id = snapshot.id
-
-            self.ledger.append(
-                EventType.STAGE_ENTERED,
-                stage=name,
-                summary=node.title,
-                payload={"attempt": stage_state.attempts, "snapshot": snapshot.id},
-            )
+            self.ledger.append(EventType.STAGE_ENTERED, stage=name, summary=node.title)
             in_flight[name] = asyncio.create_task(self._run_stage(node, state), name=name)
 
     def _check_entry_gates(self, node: StageNode, state: RunState) -> GateDecision | None:
@@ -219,32 +397,135 @@ class Engine:
                 f"entry gate {decision.gate} blocked critical stage {node.name}: {decision.reason}",
             )
 
-    # -- stage execution ---------------------------------------------------
+    # -- stage execution: retry / fallback / governance ---------------------
 
-    async def _run_stage(self, node: StageNode, state: RunState) -> StageResult | None:
-        """One attempt. Phase 3 wraps this with retry, fallback and rollback;
-        keeping the single-attempt path isolated is what makes that composable.
-        """
-        return await self._attempt_stage(node, state)
+    async def _run_stage(self, node: StageNode, state: RunState) -> StageResult:
+        """The full lifecycle of one dispatch: bounded retry around a single
+        attempt, then one fallback try if the budget is exhausted."""
+        stage_state = state.stage(node.name)
+        attempt = 0
+
+        while True:
+            attempt += 1
+            stage_state.attempts = attempt
+            label = f"pre:{node.name}" if attempt == 1 else f"pre:{node.name}:attempt{attempt}"
+            snapshot = self.workspace.snapshot(label)
+            stage_state.snapshot_id = snapshot.id
+            if attempt > 1:
+                self.ledger.append(
+                    EventType.STAGE_RETRIED,
+                    stage=node.name,
+                    summary=f"attempt {attempt}",
+                    payload={"snapshot": snapshot.id},
+                )
+
+            try:
+                return await self._attempt_stage(node, state)
+            except ApprovalPending:
+                raise  # preserve the result and workspace state; do not roll back
+            except Exception as exc:  # noqa: BLE001 - classified below, not swallowed
+                failure_class = self._record_attempt_failure(node, state, exc)
+                self._rollback_stage(node, state, f"attempt {attempt} failed: {exc}")
+
+                decision = self.retry_controller.decide(node, attempt, failure_class)
+                if decision.should_retry:
+                    if decision.delay_seconds:
+                        await asyncio.sleep(decision.delay_seconds)
+                    continue
+
+                if node.fallback is not None and not stage_state.fallback_used:
+                    fb_result = await self._try_fallback(node, state, exc)
+                    if fb_result is not None:
+                        return fb_result
+
+                raise StageExhausted(exc, failure_class) from exc
+
+    def _record_attempt_failure(
+        self, node: StageNode, state: RunState, exc: Exception
+    ) -> FailureClass:
+        """Log the cause-specific ledger event and classify it for the retry
+        controller. Separated from rollback so the ledger always shows what
+        was rejected before it shows what was reverted."""
+        stage_state = state.stage(node.name)
+        if isinstance(exc, StageRejected):
+            stage_state.gate_failures.extend(f"{d.gate}: {d.reason}" for d in exc.decisions)
+            for d in exc.decisions:
+                self.ledger.append(
+                    EventType.GATE_EXIT_BLOCKED,
+                    stage=node.name,
+                    actor=d.gate,
+                    summary=d.reason,
+                    payload={"remediation": d.remediation},
+                )
+            return FailureClass.PERMANENT
+
+        if isinstance(exc, PolicyRejected):
+            return FailureClass.POLICY  # POLICY_VIOLATION was already logged when raised
+
+        if isinstance(exc, ApprovalRejected):
+            return FailureClass.POLICY  # APPROVAL_REJECTED was already logged when raised
+
+        return classify_failure(exc)
+
+    async def _try_fallback(
+        self, node: StageNode, state: RunState, cause: Exception
+    ) -> StageResult | None:
+        stage_state = state.stage(node.name)
+        fallback = node.fallback
+        assert fallback is not None
+        stage_state.fallback_used = True
+        self.ledger.append(
+            EventType.FALLBACK_ENGAGED,
+            stage=node.name,
+            actor=fallback.name,
+            summary=f"primary path exhausted ({cause}); trying fallback {fallback.name!r}",
+        )
+        snapshot = self.workspace.snapshot(f"pre:{node.name}:fallback")
+        stage_state.snapshot_id = snapshot.id
+        try:
+            try:
+                result = await asyncio.wait_for(
+                    fallback.execute(node, state), timeout=self.config.stage_timeout_seconds
+                )
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"fallback exceeded {self.config.stage_timeout_seconds}s"
+                ) from exc
+            return await self._finalize_attempt(node, state, result)
+        except ApprovalPending:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fallback itself failed
+            self._record_attempt_failure(node, state, exc)
+            self._rollback_stage(node, state, f"fallback also failed: {exc}")
+            return None
 
     async def _attempt_stage(self, node: StageNode, state: RunState) -> StageResult:
-        result = await asyncio.wait_for(
-            self.executor(node, state), timeout=self.config.stage_timeout_seconds
-        )
+        try:
+            result = await asyncio.wait_for(
+                self.executor(node, state), timeout=self.config.stage_timeout_seconds
+            )
+        except TimeoutError as exc:
+            raise TimeoutError(
+                f"stage exceeded {self.config.stage_timeout_seconds}s"
+            ) from exc
+        return await self._finalize_attempt(node, state, result)
+
+    async def _finalize_attempt(
+        self, node: StageNode, state: RunState, result: StageResult
+    ) -> StageResult:
+        """Everything a produced result must pass before it is admissible:
+        artifact sealing, exit gates, universal policy, exit-point approval."""
         if result.stage != node.name:
             result = result.model_copy(update={"stage": node.name})
 
-        # Write artifacts so exit gates can inspect real files. A rejection
-        # restores the pre-stage snapshot, so this is not a partial commit.
+        # Write artifacts so exit gates and policy rules can inspect real
+        # files. A rejection anywhere below restores the pre-attempt snapshot.
         sealed = tuple(self.workspace.write_artifact(a) for a in result.artifacts)
         result = result.model_copy(update={"artifacts": sealed})
 
-        # Evaluate each gate exactly once: a gate is allowed to be expensive,
-        # and re-running it for the log could report a different reason.
         decisions = [gate.check(node, state, result) for gate in node.exit_gates]
         if rejections := [d for d in decisions if not d]:
             raise StageRejected(rejections)
-
         for decision in decisions:
             self.ledger.append(
                 EventType.GATE_EXIT_PASSED,
@@ -252,7 +533,87 @@ class Engine:
                 actor=decision.gate,
                 summary=decision.reason,
             )
+
+        policy_findings = self.policy_engine.evaluate(node, state, result)
+        rule_count = len(self.policy_engine.rules)
+        self.ledger.append(
+            EventType.POLICY_EVALUATED,
+            stage=node.name,
+            summary=f"{len(policy_findings)} finding(s) from {rule_count} rule(s)",
+            payload={"codes": self.policy_engine.codes},
+        )
+        if policy_findings:
+            result = result.model_copy(update={"findings": (*result.findings, *policy_findings)})
+
+        if blockers := PolicyEngine.blockers(policy_findings):
+            for finding in blockers:
+                self.ledger.append(
+                    EventType.POLICY_VIOLATION,
+                    stage=node.name,
+                    actor=finding.raised_by,
+                    summary=finding.summary,
+                    payload={"remediation": finding.remediation},
+                )
+            raise PolicyRejected(blockers)
+
+        requirement = self.approval_policy.evaluate(node, state, result, ApprovalPoint.EXIT)
+        if requirement:
+            response = await self._checkpoint(node, state, result, requirement)
+            if response is None:
+                raise ApprovalPending(state.approval_log.pending_for(node.name), result)  # type: ignore[arg-type]
+            if not response.granted:
+                raise ApprovalRejected(response)
+
         return result
+
+    async def _checkpoint(
+        self,
+        node: StageNode,
+        state: RunState,
+        result: StageResult,
+        requirement,
+    ) -> ApprovalResponse | None:
+        """Ensure a request exists, ask the provider, record whatever comes
+        back. Idempotent across retries and resumes: a stage that already has
+        an unanswered request reuses it instead of spamming duplicates."""
+        request = state.approval_log.pending_for(node.name)
+        if request is None:
+            request = ApprovalRequest(
+                run_id=self.run_id,
+                stage=node.name,
+                point=requirement.point,
+                reason=requirement.reason,
+                risk=requirement.risk,
+                summary=result.summary,
+                artifact_paths=tuple(a.path for a in result.artifacts),
+                artifact_digests=tuple(a.content_hash for a in result.artifacts),
+                findings=tuple(f"[{f.severity.value}] {f.summary}" for f in result.findings),
+                decisions=tuple(f"{d.question} -> {d.choice}" for d in result.decisions),
+            )
+            state.approval_log.record_request(request)
+            self.ledger.append(
+                EventType.APPROVAL_REQUESTED,
+                stage=node.name,
+                summary=requirement.reason,
+                payload={"request_id": request.id, "risk": requirement.risk.value},
+            )
+
+        response = await self.approval_provider.decide(request)
+        if response is None:
+            return None
+
+        state.approval_log.record_response(response)
+        event_type = (
+            EventType.APPROVAL_GRANTED if response.granted else EventType.APPROVAL_REJECTED
+        )
+        self.ledger.append(
+            event_type,
+            stage=node.name,
+            actor=response.approver,
+            summary=response.note,
+            payload={"request_id": request.id, "automated": response.automated},
+        )
+        return response
 
     # -- completion handling -----------------------------------------------
 
@@ -278,6 +639,9 @@ class Engine:
 
         error = task.exception()
         if error is not None:
+            if isinstance(error, ApprovalPending):
+                self._hold_for_approval(node, state, error.result)
+                return
             self._on_stage_error(node, state, error)
             return
 
@@ -332,37 +696,33 @@ class Engine:
                 "artifacts": len(result.artifacts),
                 "context_changed": changed,
                 "duration_s": stage_state.duration_seconds,
+                "attempts": stage_state.attempts,
+                "fallback_used": stage_state.fallback_used,
             },
         )
 
     def _on_stage_error(self, node: StageNode, state: RunState, error: BaseException) -> None:
-        if isinstance(error, StageRejected):
-            stage_state = state.stage(node.name)
-            stage_state.gate_failures.extend(f"{d.gate}: {d.reason}" for d in error.decisions)
-            for decision in error.decisions:
-                self.ledger.append(
-                    EventType.GATE_EXIT_BLOCKED,
-                    stage=node.name,
-                    actor=decision.gate,
-                    summary=decision.reason,
-                    payload={"remediation": decision.remediation},
-                )
-            self._rollback_stage(node, state, "exit gate rejected the result")
-            self._fail_stage(node, state, str(error))
-            return
+        """By the time an error reaches here, `_run_stage` has already
+        classified it, logged the cause-specific event, retried within budget
+        and tried any fallback. This only needs to record the terminal state
+        and pick the halt reason the audit trail should show as root cause.
+        """
+        cause = error.cause if isinstance(error, StageExhausted) else error
+        attempts = state.stage(node.name).attempts
+        detail = f"{type(cause).__name__}: {cause}"
+        if isinstance(error, StageExhausted):
+            detail = f"exhausted after {attempts} attempt(s): {detail}"
 
-        if isinstance(error, TimeoutError):
-            self._rollback_stage(node, state, "stage timed out")
-            self._fail_stage(
-                node, state, f"timed out after {self.config.stage_timeout_seconds}s"
-            )
-            return
+        halt_reason = HaltReason.BLOCKING_FAILURE
+        if isinstance(cause, ApprovalRejected):
+            halt_reason = HaltReason.APPROVAL_REJECTED
+        elif isinstance(cause, PolicyRejected):
+            halt_reason = HaltReason.POLICY_VIOLATION
 
-        self._rollback_stage(node, state, "stage raised")
-        self._fail_stage(node, state, f"{type(error).__name__}: {error}")
+        self._fail_stage(node, state, detail, halt_reason=halt_reason)
 
     def _rollback_stage(self, node: StageNode, state: RunState, why: str) -> None:
-        """Restore the pre-stage snapshot so a rejected attempt leaves no trace."""
+        """Restore the pre-attempt snapshot so a rejected attempt leaves no trace."""
         stage_state = state.stage(node.name)
         if stage_state.snapshot_id is None:
             return
@@ -379,7 +739,47 @@ class Engine:
             payload={"paths": changed},
         )
 
-    def _fail_stage(self, node: StageNode, state: RunState, detail: str) -> None:
+    def _cascade_rollback(self, node: StageNode, state: RunState) -> None:
+        """A stage that fails for good may invalidate work that already ran
+        downstream of it, or that is explicitly coupled to it via
+        ``rollback_with``. Revert each such stage's own workspace snapshot and
+        mark it ROLLED_BACK so it is neither mistaken for success nor silently
+        re-dispatched; a deliberate :meth:`Engine.replan` brings it back.
+        """
+        ran = state.names_with_status(StageStatus.SUCCEEDED)
+        plan = plan_rollback(self.graph, node.name, ran)
+        if not plan:
+            return
+
+        self.ledger.append(
+            EventType.ROLLBACK_STARTED,
+            stage=node.name,
+            summary=f"cascading to {len(plan.stages)} coupled/downstream stage(s)",
+            payload={"stages": list(plan.stages)},
+        )
+        for coupled_name in plan.stages:
+            coupled_state = state.stage(coupled_name)
+            if coupled_state.snapshot_id is None:
+                continue
+            changed = self.workspace.restore(coupled_state.snapshot_id)
+            coupled_state.rollbacks += 1
+            coupled_state.status = StageStatus.ROLLED_BACK
+            coupled_state.ended_at = utcnow()
+            self.ledger.append(
+                EventType.ROLLBACK_COMPLETED,
+                stage=coupled_name,
+                summary=f"reverted {len(changed)} path(s); invalidated by {node.name}",
+                payload={"paths": changed, "trigger": node.name},
+            )
+
+    def _fail_stage(
+        self,
+        node: StageNode,
+        state: RunState,
+        detail: str,
+        *,
+        halt_reason: HaltReason = HaltReason.BLOCKING_FAILURE,
+    ) -> None:
         """Three distinct failure severities, which the graph declares:
 
         * ``optional``      -> recorded as SKIPPED; the pipeline was designed to
@@ -387,6 +787,9 @@ class Engine:
         * ``critical=False`` -> FAILED, but execution continues on live branches;
                                the run finishes in a FAILED state.
         * ``critical=True``  -> FAILED and safe-stop the whole run.
+
+        A non-optional failure also cascades a rollback to whatever already-run
+        work was built on this stage — see :meth:`_cascade_rollback`.
         """
         stage_state = state.stage(node.name)
         stage_state.last_error = detail
@@ -402,24 +805,45 @@ class Engine:
 
         stage_state.status = StageStatus.FAILED
         self.ledger.append(EventType.STAGE_FAILED, stage=node.name, summary=detail)
-        if node.critical:
-            self.request_stop(
-                HaltReason.BLOCKING_FAILURE, f"critical stage {node.name} failed: {detail}"
-            )
+        self._cascade_rollback(node, state)
+
+        # A governance-driven halt reason (a human rejected a checkpoint, or a
+        # BLOCKER policy finding) is mandatory regardless of the node's own
+        # criticality: those are decisions about the run as a whole, not
+        # ordinary execution failures a non-critical branch can absorb.
+        governance_halt = halt_reason in {
+            HaltReason.APPROVAL_REJECTED,
+            HaltReason.POLICY_VIOLATION,
+        }
+        if node.critical or governance_halt:
+            self.request_stop(halt_reason, f"stage {node.name} failed: {detail}")
 
     def _hold_for_approval(self, node: StageNode, state: RunState, result: StageResult) -> None:
         """Fail closed. An unattended run must not walk past a checkpoint that
-        the agent itself flagged as needing a human."""
+        needs a human, whether the agent flagged it or governance derived it.
+
+        A governance-derived checkpoint (:meth:`_checkpoint`) has already
+        logged its own, more detailed APPROVAL_REQUESTED event by the time
+        this runs, and already recorded the request in `state.approval_log` --
+        logging again here would duplicate the audit trail and double-count
+        the reliability metric. Only the legacy path, where the agent itself
+        returned ``StageOutcome.NEEDS_APPROVAL`` without ever going through a
+        checkpoint, needs this method to create the record.
+        """
         stage_state = state.stage(node.name)
         stage_state.status = StageStatus.AWAITING_APPROVAL
         stage_state.result = result
-        self.ledger.append(
-            EventType.APPROVAL_REQUESTED,
-            stage=node.name,
-            summary=result.summary or "stage requires human approval",
+        has_governance_request = any(
+            r.stage == node.name for r in state.approval_log.requests.values()
         )
+        if not has_governance_request:
+            self.ledger.append(
+                EventType.APPROVAL_REQUESTED,
+                stage=node.name,
+                summary=result.summary or "stage requires human approval",
+            )
         self.request_stop(
-            HaltReason.APPROVAL_REJECTED,
+            HaltReason.APPROVAL_PENDING,
             f"stage {node.name} is awaiting human approval",
         )
 
@@ -507,23 +931,28 @@ class Engine:
     def _finalize(self, state: RunState) -> None:
         state.ended_at = utcnow()
         state.ledger_head = self.ledger.head
+        # Always reflect the *current* halt reason, including clearing a stale
+        # one from a prior halt: resume()/replan() reset the engine's own
+        # _halt_reason before re-entering the loop, and if this pass completes
+        # without halting again, RunState must not keep reporting the old one.
+        state.halt_reason = self._halt_reason
+        state.halt_detail = self._halt_detail
 
-        # A run is only SUCCEEDED if every non-optional stage completed. A
-        # stage that failed but was merely non-critical still means the run did
-        # not do what it set out to do -- reporting that as success would make
-        # the audit trail lie.
+        # A run is only SUCCEEDED if every non-optional stage completed and
+        # nothing was left rolled back by a cascade. A stage that failed but
+        # was merely non-critical still means the run did not do what it set
+        # out to do -- reporting that as success would make the audit trail lie.
         broken = sorted(
             n
             for n in self.graph.names
             if not self.graph[n].optional
-            and state.stage(n).status in {StageStatus.FAILED, StageStatus.BLOCKED}
+            and state.stage(n).status
+            in {StageStatus.FAILED, StageStatus.BLOCKED, StageStatus.ROLLED_BACK}
         )
 
         if self._halt_reason is not None:
             state.status = RunStatus.HALTED
-            state.halt_reason = self._halt_reason
-            state.halt_detail = self._halt_detail
-            if self._halt_reason is HaltReason.APPROVAL_REJECTED and any(
+            if self._halt_reason is HaltReason.APPROVAL_PENDING and any(
                 state.stage(n).status is StageStatus.AWAITING_APPROVAL for n in self.graph.names
             ):
                 state.status = RunStatus.AWAITING_APPROVAL

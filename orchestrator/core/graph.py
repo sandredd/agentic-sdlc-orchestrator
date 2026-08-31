@@ -26,8 +26,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from orchestrator.core.approvals import ApprovalPoint
+
 if TYPE_CHECKING:
     from orchestrator.core.gates import EntryGate, ExitGate
+    from orchestrator.core.resilience import FallbackStrategy
 
 
 class GraphValidationError(ValueError):
@@ -74,6 +77,14 @@ class StageNode:
     exit_gates: tuple[ExitGate, ...] = ()
     # Stages that must be rolled back with this one if it is reverted.
     rollback_with: frozenset[str] = field(default_factory=frozenset)
+
+    # Governance. `high_impact` forces a human checkpoint regardless of the
+    # configured autonomy level -- raising autonomy must not be able to switch
+    # off the gate on a release.
+    high_impact: bool = False
+    approval_point: ApprovalPoint = ApprovalPoint.EXIT
+    max_attempts: int | None = None      # overrides the global retry budget
+    fallback: FallbackStrategy | None = None
     description: str = ""
 
     def __post_init__(self) -> None:

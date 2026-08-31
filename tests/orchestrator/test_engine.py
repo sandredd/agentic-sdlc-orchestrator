@@ -284,12 +284,102 @@ async def test_stage_exception_is_recorded_with_type(make_engine):
 
 
 async def test_stage_timeout_fails_the_stage(make_engine):
+    from orchestrator.config import RetryPolicy
+
     graph = StageGraph([stage("slow", critical=False)])
     ex = RecordingExecutor(delays={"slow": 1.0})
-    state = await make_engine(graph, ex, stage_timeout_seconds=0.05).run(fresh_state())
+    state = await make_engine(
+        graph, ex, stage_timeout_seconds=0.05, retry=RetryPolicy(max_attempts=1)
+    ).run(fresh_state())
 
     assert state.stage("slow").status is StageStatus.FAILED
-    assert "timed out" in state.stage("slow").last_error
+    assert "exceeded" in state.stage("slow").last_error
+
+
+async def test_transient_failure_is_retried_within_budget(make_engine):
+    from orchestrator.config import RetryPolicy
+
+    graph = StageGraph([stage("flaky")])
+    calls = {"n": 0}
+
+    async def flaky_executor(node, state):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("connection reset, temporarily unavailable")
+        return result("flaky")
+
+    engine = make_engine(
+        graph, flaky_executor, retry=RetryPolicy(max_attempts=5, backoff_seconds=0.0)
+    )
+    state = await engine.run(fresh_state())
+
+    assert state.status is RunStatus.SUCCEEDED
+    assert calls["n"] == 3
+    assert state.stage("flaky").attempts == 3
+    assert len(engine.ledger.of_type(EventType.STAGE_RETRIED)) == 2
+
+
+async def test_permanent_failure_is_not_retried(make_engine):
+    graph = StageGraph([stage("broken", critical=False)])
+    calls = {"n": 0}
+
+    async def always_raises(node, state):
+        calls["n"] += 1
+        raise ValueError("schema is invalid")
+
+    state = await make_engine(graph, always_raises).run(fresh_state())
+
+    assert calls["n"] == 1, "a permanent failure must not burn the retry budget"
+    assert state.stage("broken").status is StageStatus.FAILED
+
+
+async def test_fallback_is_tried_after_retries_exhausted(make_engine):
+    from orchestrator.config import RetryPolicy
+    from orchestrator.core.resilience import ConservativeFallback
+
+    graph_holder = {}
+
+    async def primary(node, state):
+        raise RuntimeError("connection timeout")
+
+    async def simple(node, state):
+        return result("impl", artifacts=(code_artifact("app/simple.py"),))
+
+    node = stage(
+        "impl",
+        max_attempts=2,
+        fallback=ConservativeFallback(simple, description="template-based generation"),
+    )
+    graph_holder["g"] = graph = StageGraph([node])
+    engine = make_engine(graph, primary, retry=RetryPolicy(max_attempts=2, backoff_seconds=0.0))
+    state = await engine.run(fresh_state())
+
+    assert state.status is RunStatus.SUCCEEDED
+    assert state.stage("impl").fallback_used is True
+    assert "fallback:conservative" in state.stage("impl").result.summary
+    assert engine.workspace.exists("app/simple.py")
+    assert engine.ledger.of_type(EventType.FALLBACK_ENGAGED)
+
+
+async def test_fallback_failure_still_fails_the_stage_cleanly(make_engine):
+    from orchestrator.config import RetryPolicy
+    from orchestrator.core.resilience import ConservativeFallback
+
+    async def primary(node, state):
+        raise RuntimeError("connection timeout")
+
+    async def also_fails(node, state):
+        raise RuntimeError("connection timeout too")
+
+    node = stage(
+        "impl", critical=False, max_attempts=1, fallback=ConservativeFallback(also_fails)
+    )
+    graph = StageGraph([node])
+    engine = make_engine(graph, primary, retry=RetryPolicy(max_attempts=1))
+    state = await engine.run(fresh_state())
+
+    assert state.stage("impl").status is StageStatus.FAILED
+    assert state.stage("impl").fallback_used is True
 
 
 # -- safe stop -------------------------------------------------------------

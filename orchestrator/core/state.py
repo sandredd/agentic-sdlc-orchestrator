@@ -31,6 +31,7 @@ from orchestrator.contracts import (
     StageResult,
     utcnow,
 )
+from orchestrator.core.approvals import ApprovalLog
 
 
 class StageStatus(StrEnum):
@@ -43,7 +44,7 @@ class StageStatus(StrEnum):
     SKIPPED = "skipped"                      # optional stage that was bypassed
     BLOCKED = "blocked"                      # can never become ready
     STALE = "stale"                          # upstream changed; must re-run
-    ROLLED_BACK = "rolled_back"
+    ROLLED_BACK = "rolled_back"              # reverted by a cascading rollback
 
     @property
     def terminal(self) -> bool:
@@ -84,6 +85,7 @@ class HaltReason(StrEnum):
     APPROVAL_REJECTED = "approval_rejected"
     REPLAN_LIMIT_REACHED = "replan_limit_reached"
     REPLAN_REQUIRED = "replan_required"
+    APPROVAL_PENDING = "approval_pending"
     OPERATOR_STOP = "operator_stop"
 
 
@@ -220,6 +222,7 @@ class RunState(BaseModel):
     artifacts: dict[str, Artifact] = Field(default_factory=dict)
     findings: list[Finding] = Field(default_factory=list)
     decisions: list[Decision] = Field(default_factory=list)
+    approval_log: ApprovalLog = Field(default_factory=ApprovalLog)
 
     started_at: datetime | None = None
     ended_at: datetime | None = None
