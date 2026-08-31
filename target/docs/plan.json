@@ -1,8 +1,8 @@
 {
-  "normalized_requirement_id": "nreq_210c05782244",
+  "normalized_requirement_id": "nreq_90707584d0e0",
   "tasks": [
     {
-      "id": "task_f15b6d03bce3",
+      "id": "task_d76ab077b0d2",
       "title": "data model and storage repository",
       "detail": "SQLite schema + repository interface for URLs",
       "stage": "implementation",
@@ -11,88 +11,88 @@
       "risk": "low"
     },
     {
-      "id": "task_08d887abe10c",
+      "id": "task_f87ff39b28c6",
       "title": "short-code generation",
       "detail": "base62 encode/decode with a uniqueness guarantee",
       "stage": "implementation",
       "depends_on": [
-        "task_f15b6d03bce3"
+        "task_d76ab077b0d2"
       ],
       "estimate_points": 1,
       "risk": "low"
     },
     {
-      "id": "task_054409fe664d",
+      "id": "task_1b287cbbdedb",
       "title": "create endpoint",
       "detail": "POST /api/urls: validate, generate/accept code, persist",
       "stage": "implementation",
       "depends_on": [
-        "task_f15b6d03bce3",
-        "task_08d887abe10c"
+        "task_d76ab077b0d2",
+        "task_f87ff39b28c6"
       ],
       "estimate_points": 2,
       "risk": "low"
     },
     {
-      "id": "task_a8ac9474ef44",
+      "id": "task_a2c5065d2921",
       "title": "redirect endpoint",
       "detail": "GET /{code}: lookup, increment analytics, 302 or 404/410",
       "stage": "implementation",
       "depends_on": [
-        "task_f15b6d03bce3"
+        "task_d76ab077b0d2"
       ],
       "estimate_points": 2,
       "risk": "low"
     },
     {
-      "id": "task_5384b8370d13",
+      "id": "task_40d1ba44c6b8",
       "title": "custom alias handling",
       "detail": "accept custom_alias, enforce uniqueness, 409 on collision",
       "stage": "implementation",
       "depends_on": [
-        "task_f15b6d03bce3",
-        "task_054409fe664d"
+        "task_d76ab077b0d2",
+        "task_1b287cbbdedb"
       ],
       "estimate_points": 1,
       "risk": "medium"
     },
     {
-      "id": "task_b0e2fc81b43d",
+      "id": "task_39b3a176935d",
       "title": "expiration handling",
       "detail": "accept/validate expires_at; 410 once passed",
       "stage": "implementation",
       "depends_on": [
-        "task_f15b6d03bce3",
-        "task_a8ac9474ef44"
+        "task_d76ab077b0d2",
+        "task_a2c5065d2921"
       ],
       "estimate_points": 1,
       "risk": "medium"
     },
     {
-      "id": "task_41f82317753c",
+      "id": "task_681aa92f90b8",
       "title": "stats endpoint",
       "detail": "GET /api/urls/{code}/stats: click_count, last_accessed_at",
       "stage": "implementation",
       "depends_on": [
-        "task_f15b6d03bce3",
-        "task_a8ac9474ef44"
+        "task_d76ab077b0d2",
+        "task_a2c5065d2921"
       ],
       "estimate_points": 1,
       "risk": "low"
     },
     {
-      "id": "task_c6490b44c1eb",
+      "id": "task_01ede3a1f6f9",
       "title": "rate limiting middleware",
       "detail": "fixed-window limiter on the create endpoint",
       "stage": "implementation",
       "depends_on": [
-        "task_054409fe664d"
+        "task_1b287cbbdedb"
       ],
       "estimate_points": 2,
       "risk": "medium"
     },
     {
-      "id": "task_1f56e9c6171d",
+      "id": "task_de5834643bdf",
       "title": "auth scaffolding note",
       "detail": "document the no-auth prototype boundary explicitly",
       "stage": "implementation",

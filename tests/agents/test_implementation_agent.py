@@ -200,3 +200,34 @@ async def test_expiry_is_validated_at_creation_not_only_at_redirect(
         code = created.json()["code"]
         redirected = client.get(f"/{code}", follow_redirects=False)
         assert redirected.status_code == 302
+
+
+async def test_expires_at_swagger_example_is_roughly_24h_out_not_current_time(
+    provider, node, tmp_path, monkeypatch
+):
+    """The OpenAPI example FastAPI/Swagger UI pre-fills for a bare `datetime`
+    field with no example reads as the current instant -- confusing, and
+    right at the edge of the create endpoint's own 'must be in the future'
+    check. Reported directly. This only changes what /docs shows; an omitted
+    expires_at must still mean "never expires", which the second half of
+    this test confirms."""
+    from datetime import UTC, datetime, timedelta
+
+    from fastapi.testclient import TestClient
+
+    ws = await _materialize(
+        provider, node, tmp_path,
+        "Build a URL shortener with expiration support.", ["expiration handling"],
+    )
+    with materialized_app(ws.root, tmp_path, monkeypatch) as app, TestClient(app) as client:
+        schema = client.get("/openapi.json").json()
+        example = schema["components"]["schemas"]["CreateUrlRequest"]["properties"][
+            "expires_at"
+        ]["examples"][0]
+        example_dt = datetime.fromisoformat(example)
+        delta = example_dt - datetime.now(UTC)
+        assert timedelta(hours=23) < delta < timedelta(hours=25)
+
+        created = client.post("/api/urls", json={"long_url": "https://example.com"})
+        assert created.status_code == 201
+        assert created.json()["expires_at"] is None, "omitting it must still mean never-expires"

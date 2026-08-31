@@ -251,19 +251,40 @@ def delete(code: str) -> bool:
 
 def _models_py(caps: dict[str, bool]) -> str:
     alias_field = "\n    custom_alias: str | None = None" if caps["alias"] else ""
-    expiry_request_field = "\n    expires_at: datetime | None = None" if caps["expiry"] else ""
-    expiry_response_field = "\n    expires_at: datetime | None = None" if caps["expiry"] else ""
     stats_fields = (
         "\n    click_count: int\n    last_accessed_at: datetime | None = None"
         if caps["stats"]
         else ""
     )
 
+    if caps["expiry"]:
+        # expires_at has no *default* -- omitting it still means "never
+        # expires" -- but with no example, FastAPI/Swagger UI's own filler
+        # for a bare `datetime` field renders as the current instant, which
+        # reads as confusing and sits right at the edge of the create
+        # endpoint's own "must be in the future" check. `examples=[...]` only
+        # changes what /docs pre-fills; it does not change what an omitted
+        # field defaults to.
+        datetime_import = "from datetime import UTC, datetime, timedelta"
+        pydantic_import = "from pydantic import BaseModel, Field, HttpUrl"
+        expiry_request_field = (
+            "\n    expires_at: datetime | None = Field(\n"
+            "        default=None,\n"
+            "        examples=[(datetime.now(UTC) + timedelta(hours=24)).isoformat()],\n"
+            "    )"
+        )
+        expiry_response_field = "\n    expires_at: datetime | None = None"
+    else:
+        datetime_import = "from datetime import datetime"
+        pydantic_import = "from pydantic import BaseModel, HttpUrl"
+        expiry_request_field = ""
+        expiry_response_field = ""
+
     template = '''"""Pydantic request/response schemas."""
 
-from datetime import datetime
+__DATETIME_IMPORT__
 
-from pydantic import BaseModel, HttpUrl
+__PYDANTIC_IMPORT__
 
 
 class CreateUrlRequest(BaseModel):
@@ -281,7 +302,9 @@ class StatsResponse(BaseModel):
     code: str__STATS_FIELDS__
 '''
     return (
-        template.replace("__ALIAS_FIELD__", alias_field)
+        template.replace("__DATETIME_IMPORT__", datetime_import)
+        .replace("__PYDANTIC_IMPORT__", pydantic_import)
+        .replace("__ALIAS_FIELD__", alias_field)
         .replace("__EXPIRY_REQUEST_FIELD__", expiry_request_field)
         .replace("__EXPIRY_RESPONSE_FIELD__", expiry_response_field)
         .replace("__STATS_FIELDS__", stats_fields)

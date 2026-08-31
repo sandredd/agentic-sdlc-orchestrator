@@ -1,14 +1,17 @@
 """Pydantic request/response schemas."""
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 
 
 class CreateUrlRequest(BaseModel):
     long_url: HttpUrl
     custom_alias: str | None = None
-    expires_at: datetime | None = None
+    expires_at: datetime | None = Field(
+        default=None,
+        examples=[(datetime.now(UTC) + timedelta(hours=24)).isoformat()],
+    )
 
 
 class UrlResponse(BaseModel):
