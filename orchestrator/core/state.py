@@ -17,7 +17,7 @@ import json
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -259,6 +259,16 @@ class RunState(BaseModel):
 
     # -- recording ---------------------------------------------------------
 
+    # Context keys that also have a first-class, strongly-typed RunState field.
+    # Gates and downstream logic read the typed field (e.g. `NoBlockingAmbiguityGate`
+    # reads `self.normalized`, not the raw context dict), so a stage that produces
+    # one of these keys must have it projected onto the field, or that consumer
+    # silently never sees it -- exactly the bug this mapping exists to prevent.
+    _TYPED_CONTEXT_KEYS: ClassVar[dict[str, str]] = {
+        "normalized_requirement": "normalized",
+        "plan": "plan",
+    }
+
     def absorb(self, result: StageResult, *, writer: str) -> list[str]:
         """Fold a stage result into run state. Returns changed context keys.
 
@@ -274,7 +284,13 @@ class RunState(BaseModel):
         for key, value in result.context_updates.items():
             if self.context.set(key, value, writer=writer):
                 changed.append(key)
+                if field := self._TYPED_CONTEXT_KEYS.get(key):
+                    setattr(self, field, self._parse_typed_field(field, value))
         return changed
+
+    def _parse_typed_field(self, field: str, value: Any) -> Any:
+        model = {"normalized": NormalizedRequirement, "plan": Plan}[field]
+        return model.model_validate(value)
 
     # -- persistence -------------------------------------------------------
 
