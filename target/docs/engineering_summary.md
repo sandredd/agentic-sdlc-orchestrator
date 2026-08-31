@@ -18,10 +18,10 @@
   - meets the stated reliability goal without adding an external dependency (Redis); documented as not distributed-safe -- multiple app instances would each keep their own counters
 - **[implementation] which optional capabilities are implemented?** -> alias=True, expiry=True, stats=True, rate_limit=True
   - gated directly by the planning stage's task list, so implementation stays in lockstep with what was actually decomposed rather than a separately-maintained feature flag
-- **[security] is the accumulated codebase clear of known-pattern security issues?** -> yes
-  - re-ran 7 guardrail rule(s) against every artifact produced so far, plus a cross-cutting review of endpoints that have no dedicated per-line pattern to catch (e.g. missing rate limiting)
 - **[docs] what does the README document?** -> only the endpoints and capabilities implementation actually generated
   - documenting an aspirational API that doesn't match the generated code is worse than no documentation -- a reader would trust it and hit a 404
+- **[security] is the accumulated codebase clear of known-pattern security issues?** -> yes
+  - re-ran 7 guardrail rule(s) against every artifact produced so far, plus a cross-cutting review of endpoints that have no dedicated per-line pattern to catch (e.g. missing rate limiting)
 - **[testing] was the generated suite actually executed against the generated code?** -> yes: 8 passed, 0 failed
   - a generated test file is not evidence of correctness until it has actually run against the code it targets; this stage executes pytest in a real subprocess rather than only emitting the file
 - **[validation] is the accumulated evidence sufficient to recommend release?** -> yes, with documented risk
@@ -46,6 +46,7 @@
 - `docs/risk_register.md` (report, by validation)
 - `docs/security_review.md` (report, by security)
 - `docs/test_report.md` (report, by testing)
+- `pyproject.toml` (config, by implementation)
 - `requirements.txt` (config, by implementation)
 - `tests/__init__.py` (test, by testing)
 - `tests/test_api.py` (test, by testing)

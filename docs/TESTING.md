@@ -78,6 +78,22 @@ happen to match the implementation:
 - **`--no-auto-approve` without `--interactive` was a silent no-op** — it
   left `Engine`'s own default provider (`AutoApproveProvider`) in place
   instead of producing a genuinely pending checkpoint.
+- **Dependency drift broke `target/`'s own test instructions**, reported by
+  a real run against a fresh environment: a newer `starlette` release made
+  its `TestClient` prefer an `httpx2` package, falling back to the (still
+  supported, deprecation-warned) plain `httpx` only if `httpx2` was absent.
+  `target/README.md`'s `pip install pytest httpx` predated that change and
+  would break once the fallback is eventually removed. Separately, `target/`
+  had no pytest config of its own, so running `pytest` from inside a
+  standalone copy of it silently walked up and applied *this* repository's
+  `asyncio_mode` setting — harmless today (the generated tests are all
+  synchronous) but wrong, and the source of a confusing "Unknown config
+  option" warning in an environment without `pytest-asyncio` installed.
+  Fixed by depending on `httpx2` directly (both in this project's own dev
+  extras and in the generated README's test instructions) and by having
+  `implementation` emit a minimal `pyproject.toml` that scopes `target/` to
+  its own pytest rootdir — verified by reproducing the original failure in
+  a throwaway venv and confirming it no longer occurs.
 
 In each case, the fix shipped with the test that would have caught it —
 `git log` on this repository shows the commit message calling out the bug,

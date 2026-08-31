@@ -64,3 +64,18 @@ async def test_agent_includes_middleware_when_rate_limit_task_present(provider, 
     result = await ImplementationAgent(provider).run(node, state)
     paths = {a.path for a in result.artifacts}
     assert "app/middleware.py" in paths
+
+
+async def test_pyproject_toml_scopes_pytest_rootdir_to_target(provider, node):
+    """Regression test: without its own pytest config, `pytest` run from
+    inside a standalone copy of the generated service walks up and picks up
+    this orchestrator's own pyproject.toml (asyncio_mode and all), which the
+    generated service's own test environment has no plugin for -- and which
+    was never meant to apply to it in the first place."""
+    state = state_for("Build a URL shortener.")
+    state.context.set("plan", {"tasks": []}, writer="planning")
+    result = await ImplementationAgent(provider).run(node, state)
+    by_path = {a.path: a for a in result.artifacts}
+    assert "pyproject.toml" in by_path
+    assert "[tool.pytest.ini_options]" in by_path["pyproject.toml"].content
+    assert "asyncio_mode" not in by_path["pyproject.toml"].content

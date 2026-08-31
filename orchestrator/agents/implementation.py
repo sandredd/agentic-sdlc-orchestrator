@@ -59,6 +59,9 @@ class ImplementationAgent(Agent):
         artifacts.append(
             self.artifact("requirements.txt", ArtifactKind.CONFIG, _requirements_txt())
         )
+        artifacts.append(
+            self.artifact("pyproject.toml", ArtifactKind.CONFIG, _pyproject_toml())
+        )
 
         decision = self.decision(
             "which optional capabilities are implemented?",
@@ -81,6 +84,17 @@ def _requirements_txt() -> str:
     return """fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
+"""
+
+
+def _pyproject_toml() -> str:
+    return """# Marks this directory as pytest's rootdir. Without it, running pytest from
+# inside a standalone checkout of this service still finds and applies any
+# pytest config in an *ancestor* directory (pytest walks upward looking for
+# one) -- if this service was generated inside a larger project, that parent
+# config was never meant to apply here.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 """
 
 

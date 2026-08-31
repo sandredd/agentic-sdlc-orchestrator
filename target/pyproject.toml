@@ -1,0 +1,7 @@
+# Marks this directory as pytest's rootdir. Without it, running pytest from
+# inside a standalone checkout of this service still finds and applies any
+# pytest config in an *ancestor* directory (pytest walks upward looking for
+# one) -- if this service was generated inside a larger project, that parent
+# config was never meant to apply here.
+[tool.pytest.ini_options]
+testpaths = ["tests"]

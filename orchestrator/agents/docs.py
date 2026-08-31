@@ -62,7 +62,7 @@ class DocsAgent(Agent):
             "## Test it",
             "",
             "```bash",
-            "pip install pytest httpx",
+            "pip install pytest httpx2 httpx",
             "pytest",
             "```",
             "",
